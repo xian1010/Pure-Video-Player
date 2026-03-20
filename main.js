@@ -51,11 +51,16 @@ function isAdUrl(url) {
 //
 // ⚠  Replace the URL with your own repo path before publishing.
 // ⚠  vm.Script has full Node.js trust — only load from a URL you control.
-const REMOTE_LOGIC_URL = 'https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/main/remote-logic.js';
+const REMOTE_LOGIC_URL = null; // 'https://raw.githubusercontent.com/xian1010/Pure-Video-Player/refs/heads/main/remote-logic.js';
 
 let remoteLogic = null;
 
 async function loadRemoteLogic() {
+  if (!REMOTE_LOGIC_URL) {
+    console.log('[RemoteLogic] URL is null, skipping remote logic for local development.');
+    return;
+  }
+  
   const cachePath = path.join(app.getPath('userData'), 'logic-cache.js');
   const CACHE_TTL = 60 * 60 * 1000; // 1 hour
   let code = null;
@@ -160,6 +165,10 @@ function parseCards(html) {
     }
   });
 
+  if (items.length === 0) {
+    console.warn('[Scraper] Warning: No items parsed from this URL!');
+  }
+
   return items;
 }
 
@@ -177,13 +186,31 @@ function hasNextPage(html, currentPage) {
 }
 
 // ─── Category scraper ──────────────────────────────────────────────────────────
-// URL format: /vodshow/{catId}[/area/{area}][/year/{year}]/{page}.html
 async function scrapeCategory(catId, page = 1, area = '', year = '') {
   if (remoteLogic?.scrapeCategory) return remoteLogic.scrapeCategory(catId, page, area, year);
+  
+  // 基础路径是分类ID
   let path = `/vodshow/${catId}`;
-  if (area) path += `/area/${encodeURIComponent(area)}`;
-  if (year) path += `/year/${year}`;
-  path += `/${page}.html`;
+
+  // 如果地区不是空且不是‘全部’，追加 /area/名称
+  if (area && area !== '全部') {
+      path += `/area/${encodeURIComponent(area)}`;
+  }
+
+  // 如果年份不是空且不是‘全部’，追加 /year/年份
+  if (year && year !== '全部') {
+      path += `/year/${year}`;
+  }
+
+  // 页码逻辑：如果是第一页通常可以省略，或者追加 /page/1
+  if (page > 1) {
+      path += `/page/${page}`;
+  }
+  
+  // 最终拼接后缀
+  path += '.html';
+
+  console.log('--- FETCHING FILTERED URL ---', path);
   const { data: html } = await ax.get(path);
   console.log(`[Scrape] Fetched ${path}, length: ${html.length}`);
   return {
@@ -233,11 +260,12 @@ function createMainWindow() {
     backgroundColor: '#0d0d14',
     frame: false,
     titleBarStyle: 'hidden',
+    icon: path.join(__dirname, 'build/icon.png'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      devTools: true,
+      devTools: false,
     },
   });
 
@@ -538,7 +566,7 @@ async function startSniffing(targetUrl) {
       webSecurity: false, // REQUIRED to traverse into cross-origin parse iframes
       nodeIntegrationInSubFrames: true, // Force preload into ALL nested iframes
       preload: path.join(__dirname, 'preload_sniffer.js'),
-      devTools: true,
+      devTools: false,
       javascript: true,
       images: true, // Need to see the page
     },

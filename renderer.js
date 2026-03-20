@@ -27,6 +27,8 @@ const sourceTabBar       = document.getElementById('source-tab-bar');
 const filterBar          = document.getElementById('filter-bar');
 const areaChips          = document.getElementById('area-chips');
 const yearChips          = document.getElementById('year-chips');
+const genreRow           = document.getElementById('genre-row');
+const genreChips         = document.getElementById('genre-chips');
 const epSortBtn          = document.getElementById('ep-sort-btn');
 
 // Window controls
@@ -35,37 +37,60 @@ document.getElementById('btn-max').onclick   = () => window.electronAPI.maximize
 document.getElementById('btn-close').onclick = () => window.electronAPI.close();
 
 // ─── App State ────────────────────────────────────────────────────────────────
+// The ONE AND ONLY source of truth for the catalog list
+let currentParams = {
+  id: 0,         // 0=全部, 1=电影, 2=剧集, 3=综艺, 4=动漫
+  area: '',
+  year: '',
+  page: 1,
+  isSearch: false,
+  query: '',
+  isFavorites: false
+};
+
 const state = {
   view:        'catalog',
-  catId:       0,
-  page:        1,
-  query:       '',
-  isSearch:    false,
-  isFavorites: false,
   hasMore:     false,
   loading:     false,
   scrollTop:   0,
-  filterArea:  '',
-  filterYear:  '',
 };
+
+let currentFetchId = 0;
 
 let epSortDesc = false;
 let currentSourceEpisodes = [];
 
-// Map catId=0 to two requests (电影+电视剧) for the "全部" tab
+// ─── Native Subcategory IDs ───────────────────────────────────────────────────
+const CATEGORY_MAP = {
+  1: { // 电影 (流派)
+    '动作': 7, '喜剧': 9, '爱情': 9, '科幻': 6, '悬疑': 8, '战争': 10, '动画': 11
+  },
+  2: { // 电视剧 (地区)
+    '大陆': 14, '香港': 15, '台湾': 15, '日本': 16, '韩国': 16, '美国': 17
+  },
+  3: { // 综艺 (地区)
+    '大陆': 19, '香港': 20, '台湾': 20, '日本': 21, '韩国': 21
+  },
+  4: { // 动漫 (地区)
+    '大陆': 23, '日本': 24
+  }
+};
+
+// Map id=0 to two requests (电影+电视剧) for the "全部" tab
 const CAT_IDS = { 0: [1, 2, 3, 4], 1: [1], 2: [2], 3: [3], 4: [4] };
 
 // ─── Filter helpers ────────────────────────────────────────────────────────────
 function updateFilterBar() {
-  const showFilter = !state.isSearch && !state.isFavorites && state.catId !== 0;
+  const showFilter = !currentParams.isSearch && !currentParams.isFavorites && currentParams.id !== 0;
   filterBar.classList.toggle('hidden', !showFilter);
 }
 
 function resetFilterChips() {
-  state.filterArea = '';
-  state.filterYear = '';
+  currentParams.area = '';
+  currentParams.year = '';
   areaChips.querySelectorAll('.filter-chip').forEach(c => c.classList.toggle('active', c.dataset.val === ''));
   yearChips.querySelectorAll('.filter-chip').forEach(c => c.classList.toggle('active', c.dataset.val === ''));
+  if (genreChips) genreChips.querySelectorAll('.filter-chip').forEach(c => c.classList.toggle('active', c.dataset.val === ''));
 }
 
 // ─── View Transitions ─────────────────────────────────────────────────────────
@@ -94,9 +119,9 @@ function renderCards(items, append = false) {
 
   if (!items.length && !append) {
     gridEmpty.classList.add('show');
-    emptyMsg.textContent = state.isFavorites
+    emptyMsg.textContent = currentParams.isFavorites
       ? '收藏夹是空的，点击卡片上的 ★ 来添加'
-      : state.isSearch ? `未找到"${state.query}"的结果` : '暂无内容';
+      : currentParams.isSearch ? `未找到"${currentParams.query}"的结果` : '暂无内容';
     loadMoreBtn.disabled = true;
     return;
   }
@@ -133,7 +158,7 @@ function renderCards(items, append = false) {
       favBtn.classList.toggle('active', nowFaved);
       updateFavTabLabel();
       // If we're in the favorites view and just un-favorited, remove the card live
-      if (state.isFavorites && !nowFaved) {
+      if (currentParams.isFavorites && !nowFaved) {
         card.remove();
         if (!cardGrid.querySelector('.movie-card')) {
           gridEmpty.classList.add('show');
@@ -184,52 +209,54 @@ function updateFavTabLabel() {
   document.getElementById('fav-tab').textContent = n > 0 ? `★ 我的收藏 (${n})` : '★ 我的收藏';
 }
 
-// ─── Data Loading ─────────────────────────────────────────────────────────────
-async function loadPage(append = false) {
-  if (state.loading) return;
+// ─── Data Loading (Unified) ─────────────────────────────────────────────────────
+async function reloadCatalog() {
+  const fetchId = ++currentFetchId;
   state.loading = true;
   catalogStatus.textContent = '加载中…';
   loadMoreBtn.disabled = true;
 
-  if (!append) {
-    cardGrid.innerHTML = '';
-    gridEmpty.classList.remove('show');
-    renderGhosts();
-  }
+  // Instant UI clear
+  cardGrid.innerHTML = '';
+  gridEmpty.classList.remove('show');
+  renderGhosts();
+  updateFilterBar();
 
   try {
     let allItems = [];
     let anyMore  = false;
 
-    if (state.isFavorites) {
+    if (currentParams.isFavorites) {
       allItems = getFavorites();
       anyMore  = false;
-    } else if (state.isSearch) {
-      const res = await window.electronAPI.scrapeSearch(state.query, state.page);
+    } else if (currentParams.isSearch) {
+      const res = await window.electronAPI.scrapeSearch(currentParams.query, currentParams.page);
       allItems = res.items || [];
       anyMore  = res.hasMore;
       if (res.error) throw new Error(res.error);
     } else {
-      // For catId 0 (全部), fetch multiple categories on page 1 only
-      const cats = state.page === 1 ? CAT_IDS[state.catId] : [state.catId === 0 ? 1 : state.catId];
+      const cats = currentParams.page === 1 ? CAT_IDS[currentParams.id] : [currentParams.id === 0 ? 1 : currentParams.id];
       const results = await Promise.all(
-        cats.map(id => window.electronAPI.scrapeCategory(id, state.page, state.filterArea, state.filterYear))
+        cats.map(id => window.electronAPI.scrapeCategory(id, currentParams.page, currentParams.area, currentParams.year))
       );
       results.forEach(r => { allItems.push(...(r.items || [])); anyMore = anyMore || r.hasMore; });
       if (results[0]?.error) throw new Error(results[0].error);
     }
 
-    // Remove ghost placeholders on first load
-    if (!append) {
-      const ghosts = cardGrid.querySelectorAll('.ghost-card');
-      ghosts.forEach(g => g.remove());
-    }
+    if (fetchId !== currentFetchId) return;
+
+    const ghosts = cardGrid.querySelectorAll('.ghost-card');
+    ghosts.forEach(g => g.remove());
 
     state.hasMore = anyMore;
-    renderCards(allItems, append);
-    catalogStatus.textContent = allItems.length ? '' : '';
-
+    renderCards(allItems, false);
+    catalogStatus.textContent = '';
+    
+    // As requested: dump top 3 titles to console to verify data changed
+    const top3 = allItems.slice(0, 3).map(i => i.title).join(' | ');
+    console.log(`[Scraper] Parsed top 3: ${top3 || 'None'}`);
   } catch (err) {
+    if (fetchId !== currentFetchId) return;
     const ghosts = cardGrid.querySelectorAll('.ghost-card');
     ghosts.forEach(g => g.remove());
     gridEmpty.classList.add('show');
@@ -237,12 +264,56 @@ async function loadPage(append = false) {
     catalogStatus.textContent = '';
     console.error('[Catalog]', err);
   } finally {
-    state.loading = false;
+    if (fetchId === currentFetchId) state.loading = false;
+  }
+}
+
+async function loadPage(append = false) {
+  if (state.loading && append) return; 
+  if (!append) return reloadCatalog(); // safeguard for old calls
+
+  const fetchId = ++currentFetchId;
+  state.loading = true;
+  catalogStatus.textContent = '加载中…';
+  loadMoreBtn.disabled = true;
+
+  try {
+    let allItems = [];
+    let anyMore  = false;
+
+    if (currentParams.isFavorites) {
+      allItems = getFavorites();
+      anyMore  = false;
+    } else if (currentParams.isSearch) {
+      const res = await window.electronAPI.scrapeSearch(currentParams.query, currentParams.page);
+      allItems = res.items || [];
+      anyMore  = res.hasMore;
+      if (res.error) throw new Error(res.error);
+    } else {
+      const cats = [currentParams.id === 0 ? 1 : currentParams.id];
+      const results = await Promise.all(
+        cats.map(id => window.electronAPI.scrapeCategory(id, currentParams.page, currentParams.area, currentParams.year))
+      );
+      results.forEach(r => { allItems.push(...(r.items || [])); anyMore = anyMore || r.hasMore; });
+      if (results[0]?.error) throw new Error(results[0].error);
+    }
+
+    if (fetchId !== currentFetchId) return;
+
+    state.hasMore = anyMore;
+    renderCards(allItems, true);
+    catalogStatus.textContent = '';
+  } catch (err) {
+    if (fetchId !== currentFetchId) return;
+    catalogStatus.textContent = `追加失败: ${err.message}`;
+    console.error('[loadMore]', err);
+  } finally {
+    if (fetchId === currentFetchId) state.loading = false;
   }
 }
 
 async function loadMore() {
-  state.page++;
+  currentParams.page++;
   await loadPage(true);
 }
 
@@ -344,16 +415,29 @@ catTabs.forEach(tab => {
     catTabs.forEach(t => t.classList.remove('active'));
     document.getElementById('fav-tab').classList.remove('active');
     tab.classList.add('active');
-    state.catId      = Number(tab.dataset.cat);
-    state.page       = 1;
-    state.isSearch   = false;
-    state.isFavorites = false;
-    state.query      = '';
+    
+    currentParams.id          = Number(tab.dataset.cat);
+    currentParams.page        = 1;
+    currentParams.isSearch    = false;
+    currentParams.isFavorites = false;
+    currentParams.query       = '';
+    
+    // Show/hide Genre row
+    if (currentParams.id === 1) {
+      genreRow.style.display = 'flex';
+      document.getElementById('area-row').style.display = 'flex';
+    } else {
+      genreRow.style.display = 'none';
+      document.getElementById('area-row').style.display = 'flex';
+    }
+    
+    console.log('[UI Click] currentParams updated:', JSON.stringify(currentParams));
+    
     searchInput.value = '';
     resetFilterChips();
-    updateFilterBar();
     gridScroll.scrollTop = 0;
-    loadPage(false);
+    
+    reloadCatalog();
   });
 });
 
@@ -363,13 +447,14 @@ updateFavTabLabel();
 favTab.addEventListener('click', () => {
   catTabs.forEach(t => t.classList.remove('active'));
   favTab.classList.add('active');
-  state.isFavorites = true;
-  state.isSearch    = false;
-  state.query       = '';
-  state.page        = 1;
-  updateFilterBar();
+  
+  currentParams.isFavorites = true;
+  currentParams.isSearch    = false;
+  currentParams.query       = '';
+  currentParams.page        = 1;
+  
   gridScroll.scrollTop = 0;
-  loadPage(false);
+  reloadCatalog();
 });
 
 // ─── Search ───────────────────────────────────────────────────────────────────
@@ -379,13 +464,14 @@ function doSearch() {
   if (!q) return;
   catTabs.forEach(t => t.classList.remove('active'));
   favTab.classList.remove('active');
-  state.isSearch    = true;
-  state.isFavorites = false;
-  state.query       = q;
-  state.page        = 1;
-  updateFilterBar();
+  
+  currentParams.isSearch    = true;
+  currentParams.isFavorites = false;
+  currentParams.query       = q;
+  currentParams.page        = 1;
+  
   gridScroll.scrollTop = 0;
-  loadPage(false);
+  reloadCatalog();
 }
 
 searchBtn.addEventListener('click', doSearch);
@@ -402,15 +488,47 @@ filterBar.addEventListener('click', e => {
   if (!chip) return;
   const inArea = chip.closest('#area-chips');
   const inYear = chip.closest('#year-chips');
-  const container = inArea || inYear;
+  const inGenre = chip.closest('#genre-chips');
+  const container = inArea || inYear || inGenre;
   if (!container) return;
+  
+  if (chip.classList.contains('active')) return; // ignore clicking already active chip
+  
   container.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
   chip.classList.add('active');
-  if (inArea) state.filterArea = chip.dataset.val;
-  else        state.filterYear = chip.dataset.val;
-  state.page = 1;
+  
+  const activeTab = document.querySelector('.cat-tab.active');
+  const baseCat = activeTab ? Number(activeTab.dataset.cat) : 0;
+  const val = chip.dataset.val;
+
+  if (inArea) {
+    currentParams.area = val;
+    
+    if (CATEGORY_MAP[baseCat] && CATEGORY_MAP[baseCat][val]) {
+      currentParams.id = CATEGORY_MAP[baseCat][val];
+      currentParams.area = ''; 
+    } else {
+      currentParams.id = baseCat;
+    }
+  } else if (inGenre) {
+    // Movies: map genre text exclusively to Category ID
+    if (baseCat === 1 && CATEGORY_MAP[1][val]) {
+      currentParams.id = CATEGORY_MAP[1][val];
+    } else {
+      currentParams.id = baseCat;
+    }
+  } else {
+    currentParams.year = val;
+  }
+  
+  currentParams.page = 1;
+  currentParams.isSearch = false;
+  currentParams.isFavorites = false;
+  console.log('[UI Click] currentParams updated:', JSON.stringify(currentParams));
+  
   gridScroll.scrollTop = 0;
-  loadPage(false);
+  
+  reloadCatalog();
 });
 
 // ─── Load More Button + Intersection Observer ─────────────────────────────────
