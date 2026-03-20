@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"/>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com; font-src 'self' https://fonts.gstatic.com; img-src * data: blob: imgproxy:; media-src * blob:; connect-src *; worker-src 'self' blob:; child-src 'self' blob:;">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Pure Video Player</title>
+  <meta name="description" content="Ad-free Chinese drama & movie streaming portal"/>
+  <link rel="stylesheet" href="vendor/DPlayer.min.css"/>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:         #0d0d14;
+      --surface:    #13131f;
+      --card:       #181828;
+      --border:     rgba(255,255,255,0.07);
+      --accent:     #7c3aed;
+      --accent2:    #a855f7;
+      --glow:       rgba(124,58,237,0.35);
+      --text:       #e8e8f0;
+      --muted:      #5a5a7a;
+      --danger:     #f43f5e;
+      --success:    #22d3ee;
+      --r:          10px;
+    }
+    html, body { height: 100%; font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--text); overflow: hidden; user-select: none; }
+    #app { display: flex; flex-direction: column; height: 100vh; }
+
+    /* ── Title bar ──────────────────────────────────────────────────────── */
+    #titlebar {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 16px; height: 38px; flex-shrink: 0;
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      -webkit-app-region: drag;
+    }
+    .logo { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; letter-spacing: .5px; }
+    .logo svg { width: 18px; height: 18px; }
+    .logo .accent { color: var(--accent2); }
+    #win-controls { display: flex; gap: 4px; -webkit-app-region: no-drag; }
+    .win-btn { width: 26px; height: 26px; border-radius: 6px; border: none; background: transparent; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background .15s; }
+    .win-btn:hover { background: rgba(255,255,255,0.07); }
+    .win-btn.close:hover { background: rgba(244,63,94,.22); }
+    .win-btn svg { width: 13px; height: 13px; stroke: var(--muted); }
+    .win-btn.close:hover svg { stroke: var(--danger); }
+
+    /* ── View container ──────────────────────────────────────────────────── */
+    #views { flex: 1; position: relative; overflow: hidden; }
+    .view { position: absolute; inset: 0; display: flex; flex-direction: column; transition: transform .35s cubic-bezier(.4,0,.2,1), opacity .35s; }
+    .view.hidden-right { transform: translateX(100%); opacity: 0; pointer-events: none; }
+    .view.hidden-left  { transform: translateX(-100%); opacity: 0; pointer-events: none; }
+
+    /* ══════════════════════════════════════════════════════════════════════
+       CATALOG VIEW
+    ══════════════════════════════════════════════════════════════════════ */
+    #catalog-view { background: var(--bg); overflow: hidden; }
+
+    /* Category tabs + search row */
+    #catalog-header {
+      padding: 10px 20px 0;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    #cat-search-row { display: flex; gap: 10px; align-items: center; padding-bottom: 10px; }
+    #search-input {
+      flex: 1; height: 38px; padding: 0 14px; border-radius: var(--r);
+      border: 1px solid var(--border); background: var(--card); color: var(--text);
+      font-family: inherit; font-size: 13px; outline: none; transition: border-color .2s, box-shadow .2s;
+    }
+    #search-input::placeholder { color: var(--muted); }
+    #search-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--glow); }
+    #search-btn {
+      height: 38px; padding: 0 18px; border-radius: var(--r); border: none;
+      background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff;
+      font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap;
+      transition: opacity .2s, box-shadow .2s; box-shadow: 0 3px 14px var(--glow);
+    }
+    #search-btn:hover { opacity: .9; }
+
+    /* Category tabs */
+    #cat-tabs { display: flex; gap: 2px; }
+    .cat-tab {
+      padding: 6px 16px; border: none; background: transparent; cursor: pointer;
+      font-family: inherit; font-size: 13px; color: var(--muted);
+      border-bottom: 2px solid transparent; transition: color .2s, border-color .2s;
+    }
+    .cat-tab:hover { color: var(--text); }
+    .cat-tab.active { color: var(--accent2); border-bottom-color: var(--accent2); }
+
+    /* ── Filter bar (area + year) ── */
+    #filter-bar {
+      padding: 7px 20px 8px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    #filter-bar.hidden { display: none; }
+    .filter-row { display: flex; align-items: center; gap: 8px; }
+    .filter-label {
+      font-size: 11.5px; color: var(--muted); white-space: nowrap;
+      width: 26px; flex-shrink: 0;
+    }
+    .filter-chips {
+      display: flex; gap: 5px; overflow-x: auto; scrollbar-width: none;
+    }
+    .filter-chips::-webkit-scrollbar { display: none; }
+    .filter-chip {
+      background: rgba(255,255,255,0.07);
+      border: 1px solid rgba(255,255,255,0.11);
+      color: var(--muted); padding: 2px 11px; border-radius: 20px;
+      cursor: pointer; font-size: 12px; white-space: nowrap;
+      transition: all 0.15s; flex-shrink: 0;
+    }
+    .filter-chip:hover { color: var(--text); background: rgba(255,255,255,0.13); }
+    .filter-chip.active { background: #7c3aed; border-color: #7c3aed; color: #fff; }
+
+    /* ── Episode sort button ── */
+    .ep-sort-btn {
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.14);
+      color: rgba(255,255,255,0.65); padding: 3px 11px;
+      border-radius: 6px; cursor: pointer; font-size: 12px;
+      transition: all 0.15s;
+    }
+    .ep-sort-btn:hover { background: rgba(124,58,237,0.4); color: #fff; }
+    .ep-sort-btn.desc { color: #a78bfa; border-color: #7c3aed; }
+
+    /* Grid scroll area */
+    #grid-scroll { flex: 1; overflow-y: auto; padding: 18px 20px 10px; }
+    #grid-scroll::-webkit-scrollbar { width: 6px; }
+    #grid-scroll::-webkit-scrollbar-track { background: transparent; }
+    #grid-scroll::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
+
+    /* Movie grid */
+    #card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(155px, 1fr));
+      gap: 16px;
+    }
+    .movie-card {
+      background: var(--card); border-radius: var(--r); overflow: hidden;
+      cursor: pointer; transition: transform .2s, box-shadow .2s;
+      border: 1px solid var(--border);
+    }
+    .movie-card:hover { transform: translateY(-4px); box-shadow: 0 12px 32px rgba(0,0,0,.5); }
+    .card-poster { position: relative; width: 100%; aspect-ratio: 2/3; overflow: hidden; background: #1a1a28; }
+    .card-poster img { width: 100%; height: 100%; object-fit: cover; transition: transform .3s; display: block; }
+    .movie-card:hover .card-poster img { transform: scale(1.05); }
+    .card-badge {
+      position: absolute; top: 6px; left: 6px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      color: #fff; font-size: 10px; font-weight: 600; padding: 2px 7px;
+      border-radius: 4px; max-width: 90%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .card-play-overlay {
+      position: absolute; inset: 0; background: rgba(0,0,0,.45);
+      display: flex; align-items: center; justify-content: center;
+      opacity: 0; transition: opacity .2s;
+    }
+    .movie-card:hover .card-play-overlay { opacity: 1; }
+    .card-play-overlay svg { width: 44px; height: 44px; filter: drop-shadow(0 2px 8px rgba(0,0,0,.6)); }
+    .card-info { padding: 8px 10px; }
+    .card-title { font-size: 12.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* Ghost placeholders while loading */
+    .ghost-card { background: var(--card); border-radius: var(--r); border: 1px solid var(--border); overflow: hidden; animation: pulse 1.4s ease-in-out infinite; }
+    .ghost-poster { width: 100%; aspect-ratio: 2/3; background: rgba(255,255,255,.05); }
+    .ghost-info { padding: 8px 10px; }
+    .ghost-line { height: 10px; border-radius: 4px; background: rgba(255,255,255,.05); margin-top: 6px; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+
+    /* Load more / sentinel */
+    #load-more-row { text-align: center; padding: 18px 0 24px; }
+    #load-more-btn {
+      padding: 10px 28px; border-radius: var(--r); border: 1px solid var(--border);
+      background: var(--card); color: var(--text); font-family: inherit; font-size: 13px;
+      cursor: pointer; transition: background .2s, border-color .2s;
+    }
+    #load-more-btn:hover { background: rgba(255,255,255,.07); border-color: var(--accent); }
+    #load-more-btn:disabled { opacity: .4; cursor: default; }
+    #catalog-status { font-size: 12px; color: var(--muted); padding: 4px 0 16px; display:block; text-align:center; }
+
+    /* Empty / error state */
+    #grid-empty { display: none; flex-direction: column; align-items: center; justify-content: center; gap: 12px; height: 100%; color: var(--muted); }
+    #grid-empty.show { display: flex; }
+    #grid-empty svg { width: 56px; height: 56px; opacity:.3; }
+
+    /* ══════════════════════════════════════════════════════════════════════
+       PLAYER VIEW
+    ══════════════════════════════════════════════════════════════════════ */
+    #player-view { background: var(--bg); overflow-y: auto; display: flex; flex-direction: column; }
+
+    #player-toolbar {
+      display: flex; align-items: center; gap: 10px; padding: 8px 16px;
+      background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0;
+    }
+    #back-btn {
+      height: 36px; padding: 0 14px; border-radius: var(--r); border: 1px solid var(--border);
+      background: transparent; color: var(--text); font-family: inherit; font-size: 13px;
+      cursor: pointer; display: flex; align-items: center; gap: 6px; flex-shrink: 0;
+      transition: background .15s, border-color .15s;
+    }
+    #back-btn:hover { background: rgba(255,255,255,.07); border-color: var(--accent); }
+    #back-btn svg { width: 14px; height: 14px; }
+    #player-url-input {
+      flex: 1; height: 36px; padding: 0 14px; border-radius: var(--r);
+      border: 1px solid var(--border); background: var(--card); color: var(--text);
+      font-family: inherit; font-size: 13px; outline: none; transition: border-color .2s, box-shadow .2s;
+    }
+    #player-url-input::placeholder { color: var(--muted); }
+    #player-url-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--glow); }
+    #player-load-btn {
+      height: 36px; padding: 0 18px; border-radius: var(--r); border: none;
+      background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff;
+      font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap;
+      transition: opacity .2s; box-shadow: 0 3px 14px var(--glow);
+    }
+    #player-load-btn:hover { opacity: .9; }
+    #player-load-btn:disabled { opacity: .4; cursor: not-allowed; }
+
+    #player-status-bar {
+      height: 28px; padding: 0 16px; display: flex; align-items: center; gap: 8px;
+      font-size: 12px; color: var(--muted); flex-shrink: 0; transition: opacity .3s;
+    }
+    #player-status-bar.hidden { opacity: 0; }
+    #player-status-bar.error { color: var(--danger); }
+    #player-status-bar.success { color: var(--success); }
+    .spinner { width: 13px; height: 13px; border: 2px solid rgba(255,255,255,.12); border-top-color: var(--accent2); border-radius: 50%; animation: spin .7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #player-container { flex: 1 0 450px; min-height: 450px; position: relative; background: #000; overflow: hidden; }
+    #dplayer { width: 100%; height: 100%; }
+    #player-placeholder {
+      position: absolute; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 18px; background: var(--bg); z-index: 10; transition: opacity .4s;
+    }
+    #player-placeholder.hidden { opacity: 0; pointer-events: none; }
+    .ph-icon { width: 76px; height: 76px; border-radius: 50%; background: linear-gradient(135deg,rgba(124,58,237,.18),rgba(168,85,247,.18)); border: 1px solid rgba(124,58,237,.3); display: flex; align-items: center; justify-content: center; box-shadow: 0 0 40px rgba(124,58,237,.12); }
+    .ph-icon svg { width: 32px; height: 32px; }
+    .ph-text { text-align: center; }
+    .ph-text h2 { font-size: 16px; font-weight: 600; background: linear-gradient(135deg,var(--accent2),#60a5fa); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 5px; }
+    .ph-text p { font-size: 12.5px; color: var(--muted); max-width: 320px; line-height: 1.6; }
+
+    .episode-list-container {
+      margin: 16px;
+      padding: 16px;
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 8px;
+      flex-shrink: 0;
+    }
+    .episode-list-container.hidden { display: none; }
+
+    /* ── Source / line tabs ── */
+    .source-tab-bar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .source-tab-bar.hidden { display: none; }
+    .source-tab {
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.15);
+      color: rgba(255,255,255,0.7);
+      padding: 4px 14px;
+      border-radius: 20px;
+      cursor: pointer;
+      font-size: 12.5px;
+      transition: all 0.18s;
+      white-space: nowrap;
+    }
+    .source-tab:hover { background: rgba(124,58,237,0.4); color: #fff; }
+    .source-tab.active { background: #7c3aed; border-color: #7c3aed; color: #fff; }
+
+    /* ── HLS quality selector overlay ── */
+    .hls-quality-btn {
+      position: absolute;
+      right: 105px;
+      bottom: 7px;
+      z-index: 99;
+      background: rgba(0,0,0,0.55);
+      border: none;
+      color: #fff;
+      font-size: 12px;
+      padding: 3px 9px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .hls-quality-btn:hover { background: rgba(124,58,237,0.8); }
+    .hls-quality-menu {
+      position: absolute;
+      right: 105px;
+      bottom: 34px;
+      z-index: 100;
+      background: rgba(20,20,30,0.92);
+      border-radius: 6px;
+      padding: 4px 0;
+      display: none;
+      min-width: 80px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    }
+    .hls-quality-menu.open { display: block; }
+    .hls-quality-item {
+      display: block;
+      width: 100%;
+      background: none;
+      border: none;
+      color: rgba(255,255,255,0.85);
+      padding: 6px 14px;
+      text-align: left;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .hls-quality-item:hover { background: rgba(124,58,237,0.5); color: #fff; }
+    .hls-quality-item.active { color: #a78bfa; font-weight: 600; }
+
+    .episode-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
+      gap: 10px;
+    }
+    .ep-btn {
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255,255,255,0.1);
+      color: #fff;
+      padding: 8px;
+      border-radius: 6px;
+      cursor: pointer;
+      text-align: center;
+      font-size: 13px;
+      transition: all 0.2s;
+    }
+    .ep-btn:hover { background: rgba(124, 58, 237, 0.5); }
+    .ep-btn.active { background: #7c3aed; border-color: #7c3aed; }
+
+    .cat-tab.fav-tab { gap: 4px; }
+    .cat-tab.fav-tab.active { color: #fbbf24; border-bottom-color: #fbbf24; }
+
+    /* Favourite star overlay on each card */
+    .card-fav-btn {
+      position: absolute; top: 6px; right: 6px; z-index: 3;
+      width: 26px; height: 26px; border-radius: 50%; border: none;
+      background: rgba(0,0,0,.45); color: rgba(255,255,255,.5);
+      font-size: 15px; line-height: 26px; text-align: center;
+      cursor: pointer; -webkit-app-region: no-drag;
+      transition: color .15s, background .15s;
+    }
+    .card-fav-btn:hover { color: #fbbf24; background: rgba(0,0,0,.7); }
+    .card-fav-btn.active { color: #fbbf24; background: rgba(0,0,0,.6); }
+
+    #player-fav-btn {
+      height: 36px; padding: 0 14px; border-radius: var(--r); border: 1px solid var(--border);
+      background: transparent; color: var(--muted); font-size: 15px;
+      cursor: pointer; flex-shrink: 0; transition: color .15s, border-color .15s;
+    }
+    #player-fav-btn:hover { color: #fbbf24; border-color: #fbbf24; }
+    #player-fav-btn.active { color: #fbbf24; border-color: #fbbf24; }
+
+    .toast {
+      position: fixed; bottom: 20px; right: 20px; padding: 11px 16px;
+      border-radius: var(--r); font-size: 13px; max-width: 340px; z-index: 9999;
+      backdrop-filter: blur(12px); animation: slideIn .3s ease;
+    }
+    .toast.error   { background: rgba(244,63,94,.14); border: 1px solid rgba(244,63,94,.35); color: var(--danger); }
+    .toast.success { background: rgba(34,211,238,.12); border: 1px solid rgba(34,211,238,.3); color: var(--success); }
+    @keyframes slideIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Title bar ────────────────────────────────────────────────────────── -->
+  <div id="titlebar">
+    <div class="logo">
+      <svg viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="12" r="10" fill="url(#g)"/>
+        <polygon points="10,8 17,12 10,16" fill="#fff"/>
+        <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#7c3aed"/>
+          <stop offset="100%" stop-color="#a855f7"/>
+        </linearGradient></defs>
+      </svg>
+      Pure<span class="accent">Video</span>Player
+    </div>
+    <div id="win-controls">
+      <button class="win-btn" id="btn-min" title="Minimize">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      </button>
+      <button class="win-btn" id="btn-max" title="Maximize">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+      </button>
+      <button class="win-btn close" id="btn-close" title="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- ── Views ─────────────────────────────────────────────────────────────── -->
+  <div id="views">
+
+    <!-- CATALOG VIEW -->
+    <div class="view" id="catalog-view">
+      <div id="catalog-header">
+        <div id="cat-search-row">
+          <input type="search" id="search-input" placeholder="搜索电影、电视剧…" spellcheck="false" autocomplete="off"/>
+          <button id="search-btn">搜索</button>
+        </div>
+        <div id="cat-tabs">
+          <button class="cat-tab active" data-cat="0">全部首页</button>
+          <button class="cat-tab" data-cat="1">电影</button>
+          <button class="cat-tab" data-cat="2">电视剧</button>
+          <button class="cat-tab" data-cat="3">综艺</button>
+          <button class="cat-tab" data-cat="4">动漫</button>
+          <button class="cat-tab fav-tab" id="fav-tab">★ 我的收藏</button>
+        </div>
+      </div>
+
+      <!-- ── Filter bar (area + year) ── -->
+      <div id="filter-bar" class="hidden">
+        <div class="filter-row">
+          <span class="filter-label">地区</span>
+          <div class="filter-chips" id="area-chips">
+            <button class="filter-chip active" data-val="">全部</button>
+            <button class="filter-chip" data-val="大陆">大陆</button>
+            <button class="filter-chip" data-val="香港">香港</button>
+            <button class="filter-chip" data-val="台湾">台湾</button>
+            <button class="filter-chip" data-val="美国">美国</button>
+            <button class="filter-chip" data-val="韩国">韩国</button>
+            <button class="filter-chip" data-val="日本">日本</button>
+          </div>
+        </div>
+        <div class="filter-row">
+          <span class="filter-label">年份</span>
+          <div class="filter-chips" id="year-chips">
+            <button class="filter-chip active" data-val="">全部</button>
+            <button class="filter-chip" data-val="2026">2026</button>
+            <button class="filter-chip" data-val="2025">2025</button>
+            <button class="filter-chip" data-val="2024">2024</button>
+            <button class="filter-chip" data-val="2023">2023</button>
+            <button class="filter-chip" data-val="2022">2022</button>
+            <button class="filter-chip" data-val="2021">2021</button>
+            <button class="filter-chip" data-val="2020">2020</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="grid-scroll">
+        <div id="card-grid"></div>
+        <div id="grid-empty">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+          </svg>
+          <span id="empty-msg">暂无内容</span>
+        </div>
+        <div id="load-more-row">
+          <button id="load-more-btn" disabled>加载更多</button>
+        </div>
+        <span id="catalog-status"></span>
+        <div id="scroll-sentinel" style="height:1px"></div>
+      </div>
+    </div>
+
+    <!-- PLAYER VIEW -->
+    <div class="view hidden-right" id="player-view">
+      <div id="player-toolbar">
+        <button id="back-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+          返回目录
+        </button>
+        <button id="player-fav-btn" title="收藏">★</button>
+        <input type="url" id="player-url-input" placeholder="直接粘贴影片 URL…" spellcheck="false" autocomplete="off"/>
+        <button id="player-load-btn">播放</button>
+      </div>
+      <div id="player-status-bar" class="hidden">
+        <div class="spinner" id="spinner"></div>
+        <span id="status-text"></span>
+      </div>
+      <div id="player-container">
+        <div id="player-placeholder">
+          <div class="ph-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="url(#pg)" stroke-width="1.5">
+              <defs><linearGradient id="pg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#7c3aed"/><stop offset="100%" stop-color="#a855f7"/></linearGradient></defs>
+              <rect x="2" y="3" width="20" height="14" rx="2"/>
+              <path d="M8 21h8M12 17v4"/>
+              <polygon points="10,8 16,10 10,13" fill="url(#pg)" stroke="none"/>
+            </svg>
+          </div>
+          <div class="ph-text">
+            <h2>选择影片或粘贴链接</h2>
+            <p>从目录点击影片卡片，或在上方直接粘贴链接后点击"播放"。</p>
+          </div>
+        </div>
+        <div id="dplayer"></div>
+      </div>
+      <!-- Episode List Container -->
+      <div id="episode-list-container" class="episode-list-container hidden">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+          <span style="color:rgba(255,255,255,0.6); font-size:14px; font-weight:500;">选集列表</span>
+          <button id="ep-sort-btn" class="ep-sort-btn">排序 ⇅</button>
+        </div>
+        <div id="source-tab-bar" class="source-tab-bar hidden"></div>
+        <div id="episode-grid" class="episode-grid"></div>
+      </div>
+    </div>
+
+  </div><!-- /views -->
+</div>
+
+<script src="vendor/hls.min.js"></script>
+<script src="vendor/DPlayer.min.js"></script>
+<script src="renderer.js"></script>
+</body>
+</html>
