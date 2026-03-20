@@ -1,6 +1,6 @@
 {
   "name": "pure-video-player",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "An Electron-based ad-free video player with catalog browsing and m3u8 stream sniffing",
   "main": "main.js",
   "scripts": {
@@ -23,7 +23,9 @@
       "owner": "xian1010",
       "repo": "Pure-Video-Player"
     },
-    "directories": { "output": "dist" },
+    "directories": {
+      "output": "dist"
+    },
     "win": {
       "target": "nsis",
       "icon": "build/icon.ico"
