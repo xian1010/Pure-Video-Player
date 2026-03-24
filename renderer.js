@@ -1021,16 +1021,9 @@ function launchPlayer(streamUrl) {
   const is4K = sourceName.toUpperCase().includes('4K');
 
   const plugins = [];
-  if (is4K) {
+  if (is4K && typeof artplayerPluginHevcWasm === 'function') {
     showToast('已为 4K 线路注入 WASM软解支持', 'success');
-    const s = document.createElement('script');
-    s.src = 'https://static.okokserver.com/js/www/assembly.js';
-    document.body.appendChild(s);
-
-    plugins.push(function artplayerPluginHevcWasm(art) {
-      console.log('[WASM-HEVC] Hooked into assembly.js decoder bypass.');
-      return { name: 'artplayerPluginHevcWasm' };
-    });
+    plugins.push(artplayerPluginHevcWasm());
   }
 
   dpInstance = new Artplayer({

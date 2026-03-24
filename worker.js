@@ -256,20 +256,13 @@ async function handle(request) {
         return json({ error: `Upstream ${upstream.status} for ${target}` }, upstream.status);
       }
 
-      const isM3u8 = ct.includes('mpegurl') || ct.includes('x-mpegurl') || /\.m3u8(\?|$)/i.test(target);
+      // Detect binary segments by content-type or URL extension — these must
+      // NOT be read as text (UTF-8 re-encoding corrupts the binary stream).
+      const isBinary = ct.includes('video/') || ct.includes('audio/') ||
+                       ct.includes('octet-stream') ||
+                       /\.(ts|mp4|m4s|m4v|aac|mp3|fmp4)(\?|$)/i.test(target);
 
-      if (isM3u8) {
-        // Text playlist — rewrite all segment/sub-playlist URLs through /proxy
-        const text = await upstream.text();
-        const workerBase = `${u.protocol}//${u.host}`;
-        const rewritten  = rewriteM3u8(text, workerBase, target);
-        return cors(rewritten, {
-          status: upstream.status,
-          headers: { 'Content-Type': ct || 'application/vnd.apple.mpegurl' },
-        });
-      } else {
-        // Binary content (TS segments, MP4 init, etc.) — MUST use arrayBuffer,
-        // not text(), to avoid UTF-8 re-encoding corrupting the binary stream.
+      if (isBinary) {
         const body = await upstream.arrayBuffer();
         return cors(body, {
           status: upstream.status,
@@ -277,6 +270,30 @@ async function handle(request) {
             'Content-Type':  ct || 'application/octet-stream',
             'Cache-Control': 'public, max-age=86400',
           },
+        });
+      }
+
+      // For everything else, read as text and check if it's an M3U8 playlist.
+      // We also peek at the body (startsWith '#EXTM3U') to catch servers that
+      // return the wrong Content-Type header.
+      const text = await upstream.text();
+      const isM3u8 = ct.includes('mpegurl') || ct.includes('x-mpegurl') ||
+                     /\.m3u8(\?|$)/i.test(target) ||
+                     text.trimStart().startsWith('#EXTM3U');
+
+      if (isM3u8) {
+        // Text playlist — rewrite all segment/sub-playlist URLs through /proxy
+        const workerBase = `${u.protocol}//${u.host}`;
+        const rewritten  = rewriteM3u8(text, workerBase, target);
+        return cors(rewritten, {
+          status: upstream.status,
+          headers: { 'Content-Type': 'application/vnd.apple.mpegurl' },
+        });
+      } else {
+        // Unknown text content (JSON, HTML error page, etc.) — pass through as-is
+        return cors(text, {
+          status: upstream.status,
+          headers: { 'Content-Type': ct || 'text/plain' },
         });
       }
     } catch (err) {
