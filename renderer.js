@@ -30,6 +30,8 @@ if (!isElectron) {
     _dbgPush(`ERR: ${msg} @ ${src}:${line}`, '#f87171');
   window.onunhandledrejection = (e) =>
     _dbgPush(`UNHANDLED: ${e.reason}`, '#fb923c');
+  // Startup diagnostic
+  console.log(`[Init] isIOS=${isIOS} worker=${WORKER_URL}`);
 }
 
 // ── Cloudflare Worker base URL (only used in web / iPad mode) ─────────────────
@@ -83,7 +85,9 @@ if (!isElectron) {
   }
 
   // -- Sniff event bridge: simulates IPC events with CustomEventTarget --------
-  const sniffBus = new EventTarget();
+  // Use `let` so removeAllListeners() can replace the bus entirely.
+  // Closures reference the variable, so reassignment orphans old listeners.
+  let sniffBus = new EventTarget();
   let _sniffController = null;
 
   // -- electronAPI polyfill ----------------------------------------------------
@@ -153,12 +157,11 @@ if (!isElectron) {
     // Sniffer (event-bridge pattern — triggerSniff code stays unchanged)
     stopSniff: () => { _sniffController?.abort(); },
     removeAllListeners: () => {
-      const fresh = new EventTarget();
-      Object.assign(sniffBus, fresh);         // swap internals
+      sniffBus = new EventTarget(); // replace — old listeners are orphaned & GC'd
     },
-    onM3u8Found: (cb) => sniffBus.addEventListener('m3u8-found', e => cb(e.detail), { once: true }),
-    onSniffError: (cb) => sniffBus.addEventListener('sniff-error', e => cb(e.detail), { once: true }),
-    onStatusUpdate: (cb) => sniffBus.addEventListener('status', e => cb(e.detail), { once: true }),
+    onM3u8Found:    (cb) => sniffBus.addEventListener('m3u8-found', e => cb(e.detail), { once: true }),
+    onSniffError:   (cb) => sniffBus.addEventListener('sniff-error', e => cb(e.detail), { once: true }),
+    onStatusUpdate: (cb) => sniffBus.addEventListener('status',     e => cb(e.detail), { once: true }),
     sniffUrl: async (vodUrl) => {
       _sniffController = new AbortController();
       sniffBus.dispatchEvent(new CustomEvent('status', { detail: '⏳ 正在提取播放源…' }));

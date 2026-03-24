@@ -203,13 +203,17 @@ async function extractStreamUrl(vodplayUrl) {
 }
 
 // ── M3U8 rewriter: rewrites segment/playlist URLs to go through /proxy ──────
-function rewriteM3u8(text, workerBase, referer) {
+// IMPORTANT: always embed ORIGIN as referer — CDN validates the referring
+// domain, not the m3u8 path. Using the m3u8 CDN URL as referer causes 404.
+function rewriteM3u8(text, workerBase, m3u8Url) {
   return text.split('\n').map(line => {
     line = line.trimEnd();
     if (line.startsWith('#')) return line;
     if (!line) return line;
-    const absUrl = line.startsWith('http') ? line : (referer ? new URL(line, referer).href : line);
-    return `${workerBase}/proxy?url=${encodeURIComponent(absUrl)}&referer=${encodeURIComponent(referer || ORIGIN)}`;
+    // Resolve relative paths against the m3u8 URL so we get absolute CDN URLs
+    const absUrl = line.startsWith('http') ? line : new URL(line, m3u8Url).href;
+    // Referer is always the site origin — that's what the CDN whitelist checks
+    return `${workerBase}/proxy?url=${encodeURIComponent(absUrl)}&referer=${encodeURIComponent(ORIGIN + '/')}`;
   }).join('\n');
 }
 
@@ -219,10 +223,27 @@ addEventListener('fetch', event => {
 });
 
 async function handle(request) {
-  if (request.method === 'OPTIONS') return cors('', { status: 204 });
-
   const u    = new URL(request.url);
   const path = u.pathname;
+
+  // OPTIONS preflight — respond immediately with full CORS
+  if (request.method === 'OPTIONS') return cors('', { status: 204 });
+
+  // HEAD on /proxy — HLS clients sometimes probe before GET
+  if (request.method === 'HEAD' && path === '/proxy') {
+    return new Response(null, { status: 200, headers: new Headers({
+      'Access-Control-Allow-Origin':   '*',
+      'Access-Control-Allow-Methods':  'GET, POST, HEAD, OPTIONS',
+      'Access-Control-Allow-Headers':  '*',
+      'Access-Control-Expose-Headers': '*',
+      'Content-Type': 'application/vnd.apple.mpegurl',
+    })});
+  }
+
+  // ── /test (connectivity check — verify this version is deployed) ─────────
+  if (path === '/test') {
+    return json({ ok: true, version: '2025-referer-fix', origin: ORIGIN });
+  }
 
   // ── /extract ──────────────────────────────────────────────────────────────
   if (path === '/extract') {
