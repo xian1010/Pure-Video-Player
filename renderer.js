@@ -7,6 +7,10 @@ const isIOS = !isElectron && (
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
 );
 
+// ── Cloudflare Worker base URL (only used in web / iPad mode) ─────────────────
+// Replace with your deployed worker URL before publishing the web build.
+const WORKER_URL = 'https://pure-video-proxy.yapshiuxian.workers.dev';
+
 // ─── Screen console (intercepts errors → visible on iPad, no F12 needed) ───
 if (!isElectron) {
   const _dbgEl = document.getElementById('debug-log');
@@ -33,10 +37,6 @@ if (!isElectron) {
   // Startup diagnostic
   console.log(`[Init] isIOS=${isIOS} worker=${WORKER_URL}`);
 }
-
-// ── Cloudflare Worker base URL (only used in web / iPad mode) ─────────────────
-// Replace with your deployed worker URL before publishing the web build.
-const WORKER_URL = 'https://pure-video-proxy.yapshiuxian.workers.dev';
 
 // ── Web polyfill: mirrors the electronAPI surface so the rest of the code
 //    needs zero changes when running in a browser (iPad / PWA). ───────────────
