@@ -250,7 +250,13 @@ async function handle(request) {
         },
       });
       const ct = upstream.headers.get('content-type') || '';
-      const isM3u8 = ct.includes('mpegurl') || target.includes('.m3u8');
+
+      // Surface non-2xx upstream errors with diagnostics
+      if (!upstream.ok) {
+        return json({ error: `Upstream ${upstream.status} for ${target}` }, upstream.status);
+      }
+
+      const isM3u8 = ct.includes('mpegurl') || ct.includes('x-mpegurl') || /\.m3u8(\?|$)/i.test(target);
 
       if (isM3u8) {
         // Text playlist — rewrite all segment/sub-playlist URLs through /proxy
