@@ -974,6 +974,7 @@ backBtn.addEventListener('click', () => {
 let dpInstance = null;
 let isSniffing   = false;
 let isIosLoading = false; // prevents duplicate src assignment on iOS
+let iosLoadTs    = 0;     // timestamp of last iOS load attempt (ms)
 let globalErrorToastTimer = null; // 全局计时器，防止旧的播放器实例触发的错误残留
 
 function setPlayerStatus(msg, type = 'info') {
@@ -991,6 +992,7 @@ function setPlayerLoading(on) {
 
 function launchPlayer(streamUrl) {
   isIosLoading = false; // reset lock — new episode cancels any in-flight iOS preflight
+  iosLoadTs    = 0;
   if (dpInstance) {
     try { dpInstance.pause(); } catch (_) { }
     try { if (dpInstance.video) dpInstance.video.muted = true; } catch (_) { }
@@ -1078,15 +1080,22 @@ function launchPlayer(streamUrl) {
       m3u8: function (video, url, art) {
         if (isIOS) {
           // iOS: bypass HLS.js entirely — Safari handles HLS natively.
-          // autoplay is OFF; the user must tap the centre play button.
+          // autoplay is OFF; user must tap the centre ▶ button.
 
-          // Lock: prevent a stale async IIFE (from a previous episode) from
-          // re-assigning video.src after launchPlayer has already been called again.
-          if (isIosLoading) {
-            console.log('[iOS] duplicate load suppressed');
+          // Lock: suppress duplicate loads within 1 second, and suppress any
+          // stale IIFE that survived an episode switch.
+          const now = Date.now();
+          if (isIosLoading && (now - iosLoadTs) < 1000) {
+            console.log('[iOS] duplicate load suppressed (' + (now - iosLoadTs) + 'ms since last)');
             return;
           }
           isIosLoading = true;
+          iosLoadTs    = now;
+
+          // Ensure correct attributes on the native <video> element
+          video.setAttribute('playsinline',        '');
+          video.setAttribute('webkit-playsinline', '');
+          video.setAttribute('preload',            'auto');
 
           const proxyUrl = url;
           if (debugEl) { debugEl.style.display = 'block'; debugEl.textContent = '[Debug] iOS preflight check…'; }
@@ -1116,12 +1125,11 @@ function launchPlayer(streamUrl) {
             if (debugEl) debugEl.textContent = '[Debug] iOS native HLS ready — tap ▶ to play';
             video.src = proxyUrl;
             video.load();
-            // NO video.play() here — let the user tap the ArtPlayer centre button.
-            // Calling play() here triggers AbortError on iOS when gesture is absent.
+            // NO video.play() — calling play() without a user gesture causes AbortError.
             console.log('[System] 视频已就绪，请点击屏幕中间开始播放');
 
             video.addEventListener('canplay', () => {
-              console.log('[iOS] canplay — playback ready');
+              console.log('[iOS] canplay — buffer ready, waiting for tap');
               if (debugEl) debugEl.style.display = 'none';
               isIosLoading = false;
             }, { once: true });
