@@ -1102,6 +1102,7 @@ function launchPlayer(streamUrl) {
             if (debugEl) debugEl.textContent = '[Debug] iOS native HLS loading…';
             video.src = proxyUrl;
             video.load();
+            video.play().catch(() => {}); // explicit play — muted autoplay allowed on iOS
             video.addEventListener('canplay', () => {
               console.log('[iOS] canplay — playback ready');
               if (debugEl) debugEl.style.display = 'none';
