@@ -2,36 +2,45 @@
  * Cloudflare Worker — Pure Video Player backend proxy
  *
  * Routes:
+ *   GET /test                             → { ok, version }          (deployment check)
  *   GET /extract?url=<vodplay_url>        → { streamUrl } or { error, htmlPreview }
  *   GET /proxy?url=<encoded_url>          → transparent proxy (M3U8 / TS segments)
- *   GET /api/page?path=<url_path>         → raw HTML with CORS (client parses with DOMParser)
+ *   GET /api/page?path=<url_path>         → raw HTML with CORS
  *   GET /api/search?q=<kw>&page=<n>       → { items, hasMore }
  *
- * Deploy:  wrangler publish  (or paste into CF dashboard)
+ * Deploy:  paste into Cloudflare Workers dashboard → Save & Deploy
  */
 
-const ORIGIN    = 'https://huavod.net';
-const UA        = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
-const CORS_HDRS = {
-  'Access-Control-Allow-Origin':   '*',
-  'Access-Control-Allow-Methods':  '*',
-  'Access-Control-Allow-Headers':  '*',
-  'Access-Control-Expose-Headers': '*',
-};
+const ORIGIN = 'https://huavod.net';
+const UA     = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) ' +
+               'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
-function cors(body, init = {}) {
-  const res = new Response(body, init);
-  Object.entries(CORS_HDRS).forEach(([k, v]) => res.headers.set(k, v));
-  return res;
-}
-function json(obj, status = 200) {
-  return cors(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json' } });
+// ── CORS helper ───────────────────────────────────────────────────────────────
+function addCors(headers) {
+  headers.set('Access-Control-Allow-Origin',   '*');
+  headers.set('Access-Control-Allow-Methods',  '*');
+  headers.set('Access-Control-Allow-Headers',  '*');
+  headers.set('Access-Control-Expose-Headers', '*');
+  return headers;
 }
 
-// ── Fetch helper: inject spoofed headers ────────────────────────────────────
-async function siteGet(path, extraHeaders = {}) {
-  const url = path.startsWith('http') ? path : ORIGIN + path;
-  const res = await fetch(url, {
+function corsResponse(body, status, extraHeaders = {}) {
+  const h = addCors(new Headers(extraHeaders));
+  return new Response(body, { status, headers: h });
+}
+
+function jsonResp(obj, status = 200) {
+  return corsResponse(
+    JSON.stringify(obj),
+    status,
+    { 'Content-Type': 'application/json' }
+  );
+}
+
+// ── Fetch helper (spoofed UA + Referer) ───────────────────────────────────────
+async function siteGet(url, extraHeaders = {}) {
+  const fullUrl = url.startsWith('http') ? url : ORIGIN + url;
+  const res = await fetch(fullUrl, {
     headers: {
       'User-Agent':      UA,
       'Referer':         ORIGIN + '/',
@@ -40,68 +49,48 @@ async function siteGet(path, extraHeaders = {}) {
       ...extraHeaders,
     },
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status} from ${fullUrl}`);
   return res.text();
 }
 
-// ── Helpers: Buffer-free base64 decode (Cloudflare Workers) ─────────────────
-// Returns a Uint8Array of raw bytes from a base64 string (standard or URL-safe).
+// ── Base64 decode → Uint8Array (no Node Buffer needed) ───────────────────────
 function b64ToBytes(b64) {
-  const standard = b64.replace(/-/g, '+').replace(/_/g, '/');
-  const binary   = atob(standard);
-  const bytes    = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
+  const s = b64.replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
 }
 
-// ── Stream URL decryption (synced with main.js fast-extraction) ──────────────
+// ── Decrypt mac_player_info.url (mirrors main.js) ────────────────────────────
 const M3U8_RE = /^https?:\/\/[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+\.m3u8/;
 
-function decrypt(rawUrl, encrypt) {
-  if (encrypt === 0) return rawUrl;
+function decrypt(raw, enc) {
+  if (enc === 0) return raw;
+  if (enc === 1) return decodeURIComponent(raw);
+  if (enc === 2) return decodeURIComponent(escape(atob(raw)));
 
-  if (encrypt === 1) {
-    return decodeURIComponent(rawUrl);
-  }
-
-  if (encrypt === 2) {
-    // base64 → binary string → percent-escape → decodeURIComponent
-    const bytes = atob(rawUrl);
-    return decodeURIComponent(escape(bytes));
-  }
-
-  if (encrypt === 3 && !rawUrl.startsWith('http')) {
-    // Translate main.js Buffer strategies to browser-compatible equivalents.
-    // b64ToBytes gives us the raw byte array; binary is the latin-1 string.
+  if (enc === 3 && !raw.startsWith('http')) {
     let bytes, binary;
     try {
-      bytes  = b64ToBytes(rawUrl);
-      binary = atob(rawUrl.replace(/-/g, '+').replace(/_/g, '/'));
-    } catch (_) {
-      return rawUrl; // malformed base64 — give up
-    }
+      bytes  = b64ToBytes(raw);
+      binary = atob(raw.replace(/-/g, '+').replace(/_/g, '/'));
+    } catch (_) { return raw; }
 
     const strategies = [
-      // S0: plain utf-8 decode
       () => new TextDecoder('utf-8').decode(bytes),
-      // S1: reverse binary (latin-1) string, then decodeURIComponent
       () => decodeURIComponent(binary.split('').reverse().join('')),
-      // S2: reverse byte array, then utf-8 decode
       () => new TextDecoder('utf-8').decode(new Uint8Array([...bytes].reverse())),
-      // S3: utf-8 decode, then reverse the resulting string
       () => new TextDecoder('utf-8').decode(bytes).split('').reverse().join(''),
-      // S4: unescape(reversed binary latin-1 string)
       () => unescape(binary.split('').reverse().join('')),
-      // S5: look for a bare path inside the decoded utf-8 string
       () => {
         const s = new TextDecoder('utf-8').decode(bytes);
         const m = s.match(/^[a-zA-Z0-9._\-]+(\/[a-zA-Z0-9._\-]+)+\.m3u8/);
         return m ? `https://p.okokserver.com/${m[0]}` : '';
       },
-      // S6: search for m3u8 path in reversed binary or forward binary
       () => {
-        const reversed = binary.split('').reverse().join('');
-        let m = reversed.match(/([a-zA-Z0-9_\-]+\/){1,}[a-zA-Z0-9._\-]+\.m3u8/);
+        const rev = binary.split('').reverse().join('');
+        let m = rev.match(/([a-zA-Z0-9_\-]+\/){1,}[a-zA-Z0-9._\-]+\.m3u8/);
         if (m) return `https://p.okokserver.com/${m[0]}`;
         m = binary.match(/([a-zA-Z0-9_\-]+\/){1,}[a-zA-Z0-9._\-]+\.m3u8/);
         return m ? `https://p.okokserver.com/${m[0]}` : '';
@@ -110,62 +99,44 @@ function decrypt(rawUrl, encrypt) {
 
     for (const fn of strategies) {
       try {
-        let candidate = fn();
-        // Extract the first http(s) URL from the decoded string
-        const httpMatch = candidate.match(/https?:\/\/[^\s"'<>\\]+/);
-        if (httpMatch) {
-          candidate = httpMatch[0]
-            .replace(/[O0]{4,}$/, '')
-            .replace(/[^a-zA-Z0-9._\-/:?=&%+#~@!$'()*,;]+$/, '');
-        }
-        if (M3U8_RE.test(candidate)) return candidate;
+        let c = fn();
+        const hm = c.match(/https?:\/\/[^\s"'<>\\]+/);
+        if (hm) c = hm[0].replace(/[O0]{4,}$/, '').replace(/[^a-zA-Z0-9._\-/:?=&%+#~@!$'()*,;]+$/, '');
+        if (M3U8_RE.test(c)) return c;
       } catch (_) {}
     }
   }
-
-  return rawUrl; // give up — return as-is so hail-mary can still try
+  return raw;
 }
 
-// ── Stream URL extraction (mirrors main.js fast-extraction) ─────────────────
+// ── Extract stream URL from vodplay page ─────────────────────────────────────
 async function extractStreamUrl(vodplayUrl) {
-  // Normalise voddetail → vodplay
   const url = vodplayUrl.replace(/\/voddetail\/(\d+)\.html/, '/vodplay/$1-1-1.html');
-
   const html = await siteGet(url);
 
-  // ── Parse mac_player_info block ───────────────────────────────────────────
-  // Use single-line regex first (matches the compact script tag format)
   let blockMatch = html.match(/mac_player_info\s*=\s*(\{[^\r\n]+\})/);
-  // Fallback to multiline regex (some templates span multiple lines)
   if (!blockMatch) blockMatch = html.match(/mac_player_info\s*=\s*(\{[\s\S]*?\})\s*;/);
 
-  let rawUrl  = null;
-  let encrypt = 0;
-
+  let rawUrl = null, encryptType = 0;
   if (blockMatch) {
     try {
       const info = JSON.parse(blockMatch[1]);
-      if (info.url) { rawUrl = info.url; encrypt = parseInt(info.encrypt) || 0; }
+      if (info.url) { rawUrl = info.url; encryptType = parseInt(info.encrypt) || 0; }
     } catch (_) {
       const um = blockMatch[1].match(/"url"\s*:\s*"([^"]+)"/);
       const em = blockMatch[1].match(/"encrypt"\s*:\s*(\d+)/);
-      if (um) rawUrl  = um[1];
-      if (em) encrypt = parseInt(em[1]);
+      if (um) rawUrl = um[1];
+      if (em) encryptType = parseInt(em[1]);
     }
   }
 
-  // ── Attempt decryption ────────────────────────────────────────────────────
   let streamUrl = null;
-
   if (rawUrl) {
-    // Unescape any JSON-escaped forward slashes
-    const cleaned = rawUrl.replace(/\\\//g, '/');
-    const candidate = decrypt(cleaned, encrypt);
-
+    const cleaned   = rawUrl.replace(/\\\//g, '/');
+    const candidate = decrypt(cleaned, encryptType);
     if (M3U8_RE.test(candidate)) {
       streamUrl = candidate;
-    } else if (typeof candidate === 'string' && candidate.includes('url=')) {
-      // Embedded URL pattern: ?url=<encoded_stream_url>
+    } else if (candidate.includes('url=')) {
       const m = candidate.match(/[?&]url=([^&]+)/);
       if (m) {
         const inner = decodeURIComponent(m[1]);
@@ -174,163 +145,142 @@ async function extractStreamUrl(vodplayUrl) {
     }
   }
 
-  // ── Hail-mary: scan the raw HTML for any m3u8 URL ────────────────────────
+  // Hail-mary: scan raw HTML for any m3u8 URL
   if (!streamUrl) {
-    const rawM3u8 = html.match(/(https?:\/\/[-A-Za-z0-9+&@#/%?=~_|!:,.;]+(\.m3u8))/i);
-    if (rawM3u8) {
-      streamUrl = rawM3u8[1];
+    const rm = html.match(/(https?:\/\/[-A-Za-z0-9+&@#/%?=~_|!:,.;]+(\.m3u8))/i);
+    if (rm) {
+      streamUrl = rm[1];
     } else {
-      // Try plain base64 chunks that decode to m3u8 URLs
-      const b64Chunk = html.match(/aHR0c[a-zA-Z0-9+/=]+/);
-      if (b64Chunk) {
-        try {
-          const dec = atob(b64Chunk[0]);
-          if (dec.includes('.m3u8')) streamUrl = dec;
-        } catch (_) {}
+      const b64m = html.match(/aHR0c[a-zA-Z0-9+/=]+/);
+      if (b64m) {
+        try { const d = atob(b64m[0]); if (d.includes('.m3u8')) streamUrl = d; } catch (_) {}
       }
     }
   }
 
   if (!streamUrl || !M3U8_RE.test(streamUrl)) {
-    // Return diagnostic info so the caller can debug
     throw Object.assign(
       new Error('No valid m3u8 found after decryption'),
       { htmlPreview: html.substring(0, 500) }
     );
   }
-
   return streamUrl;
 }
 
-// ── M3U8 rewriter: rewrites segment/playlist URLs to go through /proxy ──────
-// IMPORTANT: always embed ORIGIN as referer — CDN validates the referring
-// domain, not the m3u8 path. Using the m3u8 CDN URL as referer causes 404.
+// ── M3U8 rewriter ─────────────────────────────────────────────────────────────
+// Segment referer is always ORIGIN — CDN validates the DOMAIN, not the m3u8 path.
+// Previously we used the m3u8 CDN URL as referer which caused 404 on every segment.
 function rewriteM3u8(text, workerBase, m3u8Url) {
   return text.split('\n').map(line => {
-    line = line.trimEnd();
-    if (line.startsWith('#')) return line;
-    if (!line) return line;
-    // Resolve relative paths against the m3u8 URL so we get absolute CDN URLs
-    const absUrl = line.startsWith('http') ? line : new URL(line, m3u8Url).href;
-    // Referer is always the site origin — that's what the CDN whitelist checks
-    return `${workerBase}/proxy?url=${encodeURIComponent(absUrl)}&referer=${encodeURIComponent(ORIGIN + '/')}`;
+    const l = line.trimEnd();
+    if (!l || l.startsWith('#')) return l;
+    const abs = l.startsWith('http') ? l : new URL(l, m3u8Url).href;
+    return `${workerBase}/proxy?url=${encodeURIComponent(abs)}&ref=${encodeURIComponent(ORIGIN + '/')}`;
   }).join('\n');
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-addEventListener('fetch', event => {
-  event.respondWith(handle(event.request));
-});
+// ═══════════════════════════════════════════════════════════════════════════════
+addEventListener('fetch', event => event.respondWith(handle(event.request)));
 
-async function handle(request) {
-  const u    = new URL(request.url);
+async function handle(req) {
+  const u    = new URL(req.url);
   const path = u.pathname;
 
-  // OPTIONS preflight — respond immediately with full CORS
-  if (request.method === 'OPTIONS') return cors('', { status: 204 });
-
-  // HEAD on /proxy — HLS clients sometimes probe before GET
-  if (request.method === 'HEAD' && path === '/proxy') {
-    return new Response(null, { status: 200, headers: new Headers({
-      'Access-Control-Allow-Origin':   '*',
-      'Access-Control-Allow-Methods':  'GET, POST, HEAD, OPTIONS',
-      'Access-Control-Allow-Headers':  '*',
-      'Access-Control-Expose-Headers': '*',
-      'Content-Type': 'application/vnd.apple.mpegurl',
-    })});
+  // ── CORS preflight ────────────────────────────────────────────────────────
+  if (req.method === 'OPTIONS') {
+    return corsResponse('', 204);
   }
 
-  // ── /test (connectivity check — verify this version is deployed) ─────────
+  // ── HEAD /proxy — some HLS clients probe before GET ──────────────────────
+  if (req.method === 'HEAD' && path === '/proxy') {
+    return corsResponse(null, 200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+  }
+
+  // ── /test — paste this URL in browser to verify deployment ───────────────
   if (path === '/test') {
-    return json({ ok: true, version: '2025-referer-fix', origin: ORIGIN });
+    return jsonResp({ ok: true, version: '2025-c', origin: ORIGIN });
   }
 
   // ── /extract ──────────────────────────────────────────────────────────────
   if (path === '/extract') {
     const vodUrl = u.searchParams.get('url');
-    if (!vodUrl) return json({ error: 'Missing url param' }, 400);
+    if (!vodUrl) return jsonResp({ error: 'Missing url param' }, 400);
     try {
       const streamUrl = await extractStreamUrl(vodUrl);
-      return json({ streamUrl });
+      return jsonResp({ streamUrl });
     } catch (err) {
-      return json({ error: err.message, htmlPreview: err.htmlPreview || null }, 502);
+      return jsonResp({ error: err.message, htmlPreview: err.htmlPreview || null }, 502);
     }
   }
 
-  // ── /proxy (transparent proxy + M3U8 rewriting) ───────────────────────────
+  // ── /proxy ────────────────────────────────────────────────────────────────
   if (path === '/proxy') {
+    // Support both ?ref= (new) and ?referer= (legacy) parameter names
     const target  = u.searchParams.get('url');
-    const referer = u.searchParams.get('referer') || ORIGIN;
-    if (!target) return json({ error: 'Missing url param' }, 400);
+    const referer = u.searchParams.get('ref') || u.searchParams.get('referer') || ORIGIN + '/';
+    if (!target) return jsonResp({ error: 'Missing url param' }, 400);
+
+    let upstream;
     try {
-      const upstream = await fetch(target, {
+      upstream = await fetch(target, {
         headers: {
           'User-Agent': UA,
           'Referer':    referer,
           'Origin':     ORIGIN,
+          'Accept':     '*/*',
         },
       });
-      const ct = upstream.headers.get('content-type') || '';
-
-      // Surface non-2xx upstream errors with diagnostics
-      if (!upstream.ok) {
-        return json({ error: `Upstream ${upstream.status} for ${target}` }, upstream.status);
-      }
-
-      // Detect binary segments by content-type or URL extension — these must
-      // NOT be read as text (UTF-8 re-encoding corrupts the binary stream).
-      const isBinary = ct.includes('video/') || ct.includes('audio/') ||
-                       ct.includes('octet-stream') ||
-                       /\.(ts|mp4|m4s|m4v|aac|mp3|fmp4)(\?|$)/i.test(target);
-
-      if (isBinary) {
-        const body = await upstream.arrayBuffer();
-        return cors(body, {
-          status: upstream.status,
-          headers: {
-            'Content-Type':  ct || 'application/octet-stream',
-            'Cache-Control': 'public, max-age=86400',
-          },
-        });
-      }
-
-      // For everything else, read as text and check if it's an M3U8 playlist.
-      // We also peek at the body (startsWith '#EXTM3U') to catch servers that
-      // return the wrong Content-Type header.
-      const text = await upstream.text();
-      const isM3u8 = ct.includes('mpegurl') || ct.includes('x-mpegurl') ||
-                     /\.m3u8(\?|$)/i.test(target) ||
-                     text.trimStart().startsWith('#EXTM3U');
-
-      if (isM3u8) {
-        // Text playlist — rewrite all segment/sub-playlist URLs through /proxy
-        const workerBase = `${u.protocol}//${u.host}`;
-        const rewritten  = rewriteM3u8(text, workerBase, target);
-        return cors(rewritten, {
-          status: upstream.status,
-          headers: { 'Content-Type': 'application/vnd.apple.mpegurl' },
-        });
-      } else {
-        // Unknown text content (JSON, HTML error page, etc.) — pass through as-is
-        return cors(text, {
-          status: upstream.status,
-          headers: { 'Content-Type': ct || 'text/plain' },
-        });
-      }
     } catch (err) {
-      return json({ error: err.message }, 502);
+      return jsonResp({ error: `fetch failed: ${err.message}`, target }, 502);
     }
+
+    const ct = upstream.headers.get('content-type') || '';
+
+    // Return non-2xx as JSON diagnostic (visible in debug console)
+    if (!upstream.ok) {
+      return jsonResp({ error: `Upstream ${upstream.status}`, target, referer }, upstream.status);
+    }
+
+    // Binary segments — stream directly without text conversion
+    const isBinary = ct.includes('video/') || ct.includes('audio/') ||
+                     ct.includes('octet-stream') ||
+                     /\.(ts|mp4|m4s|m4v|aac|mp3|fmp4)(\?|$)/i.test(target);
+    if (isBinary) {
+      const body = await upstream.arrayBuffer();
+      return corsResponse(body, upstream.status, {
+        'Content-Type':  ct || 'application/octet-stream',
+        'Cache-Control': 'public, max-age=3600',
+      });
+    }
+
+    // Text — detect M3U8 by content-type, URL extension, or body prefix
+    const text   = await upstream.text();
+    const isM3u8 = ct.includes('mpegurl') || ct.includes('x-mpegurl') ||
+                   /\.m3u8(\?|$)/i.test(target) ||
+                   text.trimStart().startsWith('#EXTM3U');
+
+    if (isM3u8) {
+      const workerBase = `${u.protocol}//${u.host}`;
+      const rewritten  = rewriteM3u8(text, workerBase, target);
+      return corsResponse(rewritten, upstream.status, {
+        'Content-Type': 'application/vnd.apple.mpegurl',
+      });
+    }
+
+    return corsResponse(text, upstream.status, {
+      'Content-Type': ct || 'text/plain',
+    });
   }
 
-  // ── /api/page (proxy raw HTML for client-side DOMParser parsing) ──────────
+  // ── /api/page ─────────────────────────────────────────────────────────────
   if (path === '/api/page') {
     const sitePath = u.searchParams.get('path');
-    if (!sitePath) return json({ error: 'Missing path param' }, 400);
+    if (!sitePath) return jsonResp({ error: 'Missing path param' }, 400);
     try {
       const html = await siteGet(sitePath);
-      return cors(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      return corsResponse(html, 200, { 'Content-Type': 'text/html; charset=utf-8' });
     } catch (err) {
-      return json({ error: err.message }, 502);
+      return jsonResp({ error: err.message }, 502);
     }
   }
 
@@ -338,23 +288,26 @@ async function handle(request) {
   if (path === '/api/search') {
     const kw   = u.searchParams.get('q')    || '';
     const page = u.searchParams.get('page') || '1';
-    if (!kw) return json({ items: [], hasMore: false });
+    if (!kw) return jsonResp({ items: [], hasMore: false });
     try {
       const apiUrl = `${ORIGIN}/index.php/ajax/suggest?mid=1&wd=${encodeURIComponent(kw)}&pg=${page}`;
       const raw    = await siteGet(apiUrl, { Accept: 'application/json' });
       const data   = JSON.parse(raw);
-      if (!data || data.code !== 1 || !Array.isArray(data.list)) return json({ items: [], hasMore: false });
+      if (!data || data.code !== 1 || !Array.isArray(data.list))
+        return jsonResp({ items: [], hasMore: false });
       const items = data.list.map(v => ({
         title:  v.name || '',
         url:    `${ORIGIN}/voddetail/${v.id}.html`,
-        poster: (v.vod_pic || v.pic || '').startsWith('http') ? (v.vod_pic || v.pic) : (v.vod_pic || v.pic ? ORIGIN + (v.vod_pic || v.pic) : ''),
-        badge:  '',
+        poster: (v.vod_pic || v.pic || '').startsWith('http')
+          ? (v.vod_pic || v.pic)
+          : (v.vod_pic || v.pic ? ORIGIN + (v.vod_pic || v.pic) : ''),
+        badge: '',
       })).filter(v => v.title && v.url);
-      return json({ items, hasMore: Number(page) < (data.pagecount || 1) });
+      return jsonResp({ items, hasMore: Number(page) < (data.pagecount || 1) });
     } catch (err) {
-      return json({ error: err.message }, 502);
+      return jsonResp({ error: err.message }, 502);
     }
   }
 
-  return json({ error: 'Unknown route' }, 404);
+  return jsonResp({ error: `Unknown route: ${path}` }, 404);
 }
