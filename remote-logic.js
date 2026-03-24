@@ -24,6 +24,7 @@ function parseCards(html) {
 
   $('div.public-list-box, li.public-list-box').each((_i, el) => {
     const $el = $(el);
+    if ($el.closest('.swiper-wrapper').length) return; // carousel item, skip
 
     const imgEl = $el.find('img').first();
     let poster  = imgEl.attr('data-src') || imgEl.attr('src') || '';

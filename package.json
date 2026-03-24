@@ -1,12 +1,13 @@
 {
   "name": "pure-video-player",
-  "version": "2.1.0",
+  "version": "2.1.8",
   "description": "An Electron-based ad-free video player with catalog browsing and m3u8 stream sniffing",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder",
-    "dist:win": "electron-builder --win --publish always"
+    "bump": "npm version patch --no-git-tag-version",
+    "dist:win": "npm run bump && electron-builder --win --publish always"
   },
   "build": {
     "appId": "com.purevideoplayer.app",
@@ -21,7 +22,8 @@
     "publish": {
       "provider": "github",
       "owner": "xian1010",
-      "repo": "Pure-Video-Player"
+      "repo": "Pure-Video-Player",
+      "releaseType": "release"
     },
     "directories": {
       "output": "dist"
@@ -31,14 +33,16 @@
       "icon": "build/icon.ico"
     },
     "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
       "createDesktopShortcut": true,
       "installerIcon": "build/icon.ico",
       "uninstallerIcon": "build/icon.ico"
     }
   },
   "dependencies": {
+    "artplayer": "^5.4.0",
     "axios": "^1.6.8",
     "cheerio": "^1.0.0",
     "dplayer": "^1.27.1",

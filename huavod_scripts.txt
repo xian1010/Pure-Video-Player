@@ -1,0 +1,51 @@
+
+[Inline Script]:
+const COOKIE_NAME = 'CF_HUAREN_LIVE';const STORAGE_KEY = 'storage_' + COOKIE_NAME;if (!Cookies.get(COOKIE_NAME)) { const storageData = JSON.parse(localStorage.getItem(STORAGE_KEY)); if (storageData) { Cookies.set(COOKIE_NAME, storageData.value, { expires: storageData.expires }); }}
+
+[Inline Script]:
+const maccms={"vod_mask":"mask-1","path2":"/","day":"2","jx":"0","so_off":"1","bt-style":"","login-login":"/","path":"","mid":"1","aid":"15","url":"huavod.com","wapurl":"huavod.com","mob_status":"2","upload":{"protocol":"https","mode":"local","remoteurl":"http://img.test.com/","img_key":"huarenok|douban|huarenoktv","img_api":"/img.php?url=",}};
+
+[Inline Script]:
+ window.dataLayer = window.dataLayer || []; function gtag(){dataLayer.push(arguments);} gtag('js', new Date()); gtag('config', 'G-R84S8DH24J');
+
+[Inline Script]:
+new WOW().init();
+
+[Inline Script]:
+window.addEventListener("message", function(event) { if (event.data && event.data.type ==="nextUrl") { var sid = event.data.sid; var nid = event.data.nid; $(".anthology-list-play li").removeClass("on ecnav-dt"); $(".anthology-list-play em.play-on").remove(); var $target = $(".anthology-list-play li").filter(function() { var $a = $(this).find("a"); var href = $a.data("url"); if (!href) return false; var match = href.match(/vodplay\/\d+-(\d+)-(\d+)\.html/); return match && match[1] == sid && match
+
+[Inline Script]:
+maccms.jx = '0';maccms.player_style=2
+
+[Inline Script]:
+var mac_player_info={"flag":"play","encrypt":3,"trysee":0,"points":0,"link":"\/vodplay\/195342-1-1.html","link_next":"","link_pre":"","vod_data":{"vod_name":"\u6d74\u8840\u9ed1\u5e2e\uff1a\u4e0d\u673d\u4f20\u5947(\u7535\u5f71\u7248)","vod_actor":"\u57fa\u91cc\u5b89\u00b7\u58a8\u83f2,\u4e3d\u8d1d\u5361\u00b7\u5f17\u683c\u68ee,\u8482\u59c6\u00b7\u7f57\u65af,\u82cf\u83f2\u00b7\u5170\u6735,\u5948\u5fb7\u00b7\u4e39\u5185\u5229,\u6d3e\u514b\u00b7\u674e,\u4f0a\u6069\u00b7\u4f69\u514b,\u6770\u4f0a\u00b7
+
+[Inline Script]:
+ function autoSelect(){ const g = document.querySelector(".anthology-list-play .ecnav-dt"); if (g) { const y = g.closest('.anthology-list-play'); if (y) { const b = g.getBoundingClientRect().top - y.getBoundingClientRect().top - (y.clientHeight - g.clientHeight) / 2; $(y).animate({ scrollTop: b }, 1000); } } } autoSelect(); $(document).on('click', '.episode-link', function(e) { e.preventDefault(); const targetUrl = $(this).data('url'); if (targetUrl) { history.replaceState(null, '', targetUrl); 
+
+[Inline Script]:
+ let iframeObj = $('iframe')[2]; iframeObj.addEventListener('load', () => { iframeObj.contentWindow.postMessage({"id":"195342","name":"浴血黑帮：不朽传奇(电影版)-正片","group":"","next":"B","sid":"1","nid":"1","api":`${window.location.origin}/index.php/`,"dmId":"" },"*"); })
+
+[Inline Script]:
+(function() { var topButton = document.querySelector('.bj2.top.fa.ds-jiantoushang'); var hasScrolled = false; var scrollThreshold = 300; if (topButton) { window.addEventListener('scroll', function() { var scrollTop = window.pageYOffset || document.documentElement.scrollTop; if (!hasScrolled && scrollTop > 0) { hasScrolled = true; } if (hasScrolled) { if (scrollTop > scrollThreshold) { topButton.style.display = 'block'; } else { topButton.style.display = 'none'; } } }); topButton.addEventListener
+
+[Inline Script]:
+function api_jump(url){ location.href = url;};function api_jump2(url){ if(MacPlayer.Link !== url){ location.href = url; }};
+
+--- External Scripts ---
+https://cdn.jsdelivr.net/npm/js-cookie@3.0.5/dist/js.cookie.min.js
+https://static.okokserver.com/js/www/jquery.js
+https://static.okokserver.com/js/www/assembly.js
+https://static.okokserver.com/js/www/swiper.min.js
+https://www.googletagmanager.com/gtag/js?id=G-R84S8DH24J
+https://static.okokserver.com/js/www/ecscript.js
+/static/js/playerconfig.js?t=20260324
+/static/js/player.js?t=a20260324
+https://static.okokserver.com/js/www/zh.js
+/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js
+https://cdn.jsdelivr.net/npm/disable-devtool
+/static/js/chatroom.js?v=4
+
+[SUSPICIOUS SCRIPT] /static/js/playerconfig.js?t=20260324
+
+[SUSPICIOUS SCRIPT] /static/js/player.js?t=a20260324

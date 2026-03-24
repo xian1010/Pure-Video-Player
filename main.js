@@ -21,6 +21,8 @@ let autoUpdater = null;
 try { autoUpdater = require('electron-updater').autoUpdater; } catch (_) {}
 
 app.commandLine.appendSwitch('ignore-certificate-errors', 'true');
+app.commandLine.appendSwitch('enable-features', 'VaapiVideoDecoder,PlatformHEVCDecoding');
+app.commandLine.appendSwitch('disable-features', 'UseChromeOSDirectVideoDecoder');
 
 // ─── Constants ─────────────────────────────────────────────────────────────────
 const SNIFF_TIMEOUT_MS = 25_000;
@@ -122,12 +124,20 @@ async function loadRemoteLogic() {
 const ax = axios.create({
   baseURL: BASE_URL,
   timeout: 15_000,
+  responseType: 'arraybuffer',
   headers: {
     'User-Agent': CHROME_UA,
     'Referer':    BASE_URL + '/',
     'Accept':     'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
   },
+});
+
+ax.interceptors.response.use(response => {
+  if (response.data && (response.data instanceof Buffer || response.data instanceof ArrayBuffer)) {
+    response.data = new TextDecoder('utf-8').decode(response.data);
+  }
+  return response;
 });
 
 // ─── Scraping Helpers ──────────────────────────────────────────────────────────
@@ -141,8 +151,10 @@ function parseCards(html) {
   const items = [];
 
   // Primary card selector — handles both div and li variants across listing/search pages
+  // Skip items inside .swiper-wrapper (featured carousel) — those are not filter-aware
   $('div.public-list-box, li.public-list-box').each((_i, el) => {
     const $el = $(el);
+    if ($el.closest('.swiper-wrapper').length) return; // carousel item, skip
 
     // Poster
     const imgEl = $el.find('img').first();
@@ -188,31 +200,31 @@ function hasNextPage(html, currentPage) {
 // ─── Category scraper ──────────────────────────────────────────────────────────
 async function scrapeCategory(catId, page = 1, area = '', year = '') {
   if (remoteLogic?.scrapeCategory) return remoteLogic.scrapeCategory(catId, page, area, year);
-  
-  // 基础路径是分类ID
+
   let path = `/vodshow/${catId}`;
+  if (area && area !== '全部') path += `/area/${encodeURIComponent(area)}`;
+  if (year && year !== '全部') path += `/year/${year}`;
+  path += page > 1 ? `/${page}.html` : '.html';
 
-  // 如果地区不是空且不是‘全部’，追加 /area/名称
-  if (area && area !== '全部') {
-      path += `/area/${encodeURIComponent(area)}`;
-  }
-
-  // 如果年份不是空且不是‘全部’，追加 /year/年份
-  if (year && year !== '全部') {
-      path += `/year/${year}`;
-  }
-
-  // 页码逻辑：如果是第一页通常可以省略，或者追加 /page/1
-  if (page > 1) {
-      path += `/page/${page}`;
-  }
+  console.log('[Scraper] Requesting URL:', BASE_URL + path);
   
-  // 最终拼接后缀
-  path += '.html';
+  let html = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const { data } = await ax.get(path, { timeout: 15000 });
+      html = data;
+      break;
+    } catch (err) {
+      if (attempt === 3) {
+        console.error(`[Scrape] Category error after 3 attempts: ${err.message}`);
+        throw new Error('目标网站响应缓慢，请稍后再试');
+      }
+      console.log(`[Scrape] Category 502/Error on ${path}, retrying (${attempt}/3)...`);
+      await new Promise(r => setTimeout(r, 1500 * attempt));
+    }
+  }
 
-  console.log('--- FETCHING FILTERED URL ---', path);
-  const { data: html } = await ax.get(path);
-  console.log(`[Scrape] Fetched ${path}, length: ${html.length}`);
+  console.log(`[Scrape] Fetched ${path}, length: ${html?.length}`);
   return {
     items:   parseCards(html),
     hasMore: hasNextPage(html, page),
@@ -225,12 +237,31 @@ async function scrapeCategory(catId, page = 1, area = '', year = '') {
 async function scrapeSearch(keyword, page = 1) {
   if (remoteLogic?.scrapeSearch) return remoteLogic.scrapeSearch(keyword, page);
   const encoded = encodeURIComponent(keyword);
-  const url = `/index.php/ajax/suggest?mid=1&wd=${encoded}&pg=${page}`;
-  const { data: json } = await ax.get(url);
+  let url = `/index.php/ajax/suggest?mid=1&wd=${encoded}&pg=${page}`;
+  
+  console.log('Final Search URL:', BASE_URL + url);
+  
+  let json = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      // Forcing a fresh User-Agent every request if needed, but it's already in ax defaults
+      const { data } = await ax.get(url, { timeout: 15000 });
+      // IMPORTANT FIX: Because of TextDecoder in interceptor, data might be a JSON string!
+      json = typeof data === 'string' ? JSON.parse(data) : data;
+      break;
+    } catch (err) {
+      if (attempt === 3) {
+        console.error(`[Search] Error after 3 attempts: ${err.message}`);
+        throw new Error('目标网站响应缓慢，请稍后再试');
+      }
+      console.log(`[Search] 502/Error, retrying (${attempt}/3)...`);
+      await new Promise(r => setTimeout(r, 1500 * attempt));
+    }
+  }
 
   if (!json || json.code !== 1 || !Array.isArray(json.list)) {
-    console.warn('[Search] Unexpected response:', JSON.stringify(json).slice(0, 200));
-    return { items: [], hasMore: false };
+    console.warn('[Search] Unexpected response:', JSON.stringify(json || '').slice(0, 200));
+    throw new Error('目标网站响应缓慢或无结果，请稍后再试');
   }
 
   const items = json.list.map(v => {
@@ -265,8 +296,20 @@ function createMainWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      devTools: false,
+      devTools: true,
+      autoplayPolicy: 'no-user-gesture-required',
+      hardwareAcceleration: true,
     },
+  });
+
+  // mainWindow.webContents.openDevTools();
+
+  // Allow manual toggling of DevTools using Ctrl+Shift+I
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.control && input.shift && input.key.toLowerCase() === 'i') {
+      mainWindow.webContents.toggleDevTools();
+      event.preventDefault();
+    }
   });
 
   mainWindow.loadFile('index.html');
@@ -300,6 +343,7 @@ function registerImageProxy() {
           'User-Agent': CHROME_UA,
           'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
         },
+        timeout: 3000,
         httpsAgent: new https.Agent({ rejectUnauthorized: false })
       });
       return new Response(resp.data, {
@@ -307,7 +351,11 @@ function registerImageProxy() {
         headers: { 'Content-Type': resp.headers['content-type'] || 'image/jpeg' }
       });
     } catch (e) {
-      return new Response(`Proxy error: ${e.message}`, { status: 502 });
+      // If the proxy fails, just gracefully redirect the browser to fetch the raw image directly
+      return new Response(null, {
+        status: 302,
+        headers: { 'Location': realUrl }
+      });
     }
   });
 }
@@ -345,217 +393,41 @@ function registerPermanentRefererSpoofer() {
       cb({ requestHeaders: headers });
     }
   );
+
+  // Bypass CORS for all media requests (especially HLS segments and m3u8)
+  // since mainWindow operates from file:// and some CDNs don't send ACAO headers.
+  session.defaultSession.webRequest.onHeadersReceived(
+    { urls: ['<all_urls>'] },
+    (details, cb) => {
+      const respHeaders = { ...details.responseHeaders };
+      respHeaders['Access-Control-Allow-Origin'] = ['*'];
+      respHeaders['Access-Control-Allow-Headers'] = ['*'];
+      cb({ responseHeaders: respHeaders });
+    }
+  );
 }
 
 /**
  * Start sniffing targetUrl for its real (non-ad) m3u8 stream.
  */
-async function startSniffing(targetUrl) {
+async function startSniffing(targetUrl, sourceName = '') {
+  if (snifferWin) {
+    try { snifferWin.destroy(); } catch (_) {}
+    snifferWin = null;
+  }
   cleanupSniffer();
   sniffAborted = false;
 
   let finalUrl = targetUrl;
-
-  // If it's a detail page, aggressively mutate the string to the play page standard
   if (targetUrl.includes('/voddetail/')) {
     sendStatus('🔍 直接跨越进入播放页…');
     finalUrl = targetUrl.replace('/voddetail/', '/vodplay/').replace('.html', '-1-1.html');
     if (!finalUrl.startsWith('http')) finalUrl = BASE_URL + finalUrl;
   }
 
-  // FAST EXTRACTION: Parse mac_player_info from the play page for instant playback
-  if (finalUrl.includes('/vodplay/')) {
-    sendStatus('⚡ 尝试智能提取真实播放源 (秒播模式)…');
-    try {
-      const { data: html } = await ax.get(finalUrl);
+  sendStatus('🚀 并行启动深度嗅探引擎与快速提取…');
 
-      // ── Step 1: Extract url+encrypt ONLY from within mac_player_info block ──
-      // Anchoring to this block prevents accidentally matching other "url" keys
-      // elsewhere on the page (thumbnails, nav links, etc.) which caused the
-      // encrypt:3 乱码 bug on TV-show pages.
-      let streamUrl = null;
-      let encrypt   = 0;
-
-      const blockMatch = html.match(/mac_player_info\s*=\s*(\{[^\r\n]+\})/);
-      if (blockMatch) {
-        try {
-          // Prefer a proper JSON parse (handles \" and \/ escapes correctly)
-          const info = JSON.parse(blockMatch[1]);
-          if (info.url) { streamUrl = info.url; encrypt = parseInt(info.encrypt) || 0; }
-        } catch(_) {
-          // JSON sometimes has unquoted keys; fall back to regex within the block
-          const um = blockMatch[1].match(/"url"\s*:\s*"([^"]+)"/);
-          const em = blockMatch[1].match(/"encrypt"\s*:\s*(\d+)/);
-          if (um) streamUrl = um[1];
-          if (em) encrypt   = parseInt(em[1]);
-        }
-      }
-      // Global fallback if the block pattern wasn't found at all
-      if (!streamUrl) {
-        const um = html.match(/"url"\s*:\s*"([^"]+)"/);
-        const em = html.match(/"encrypt"\s*:\s*(\d+)/);
-        if (um) streamUrl = um[1];
-        if (em) encrypt   = parseInt(em[1]);
-      }
-
-      if (streamUrl) {
-        // Unescape JSON-escaped forward-slashes (\/ → /)
-        streamUrl = streamUrl.replace(/\\\//g, '/');
-        console.log(`\n[Sniffer] mac_player_info: url="${streamUrl.slice(0, 60)}..." encrypt=${encrypt}\n`);
-
-        // ── Step 2: Decrypt ────────────────────────────────────────────────
-        if (encrypt === 1) {
-          streamUrl = decodeURIComponent(streamUrl);
-
-        } else if (encrypt === 2) {
-          streamUrl = decodeURIComponent(escape(Buffer.from(streamUrl, 'base64').toString('binary')));
-
-        } else if (encrypt === 3 && !streamUrl.startsWith('http')) {
-          // MacCMS encrypt:3 — different site templates use different schemes.
-          // Evidence from live logs: "8u3m.xedni" = "index.m3u8" reversed, which
-          // means S1-S4 (all of which reverse) are reversing an already-correct URL.
-          // → huavod.net stores a plain btoa(url), so S0 (no reversal) must come first.
-          // Some templates also pad the encoded value with junk like "O0O0O0" before
-          // or after the real URL, so we extract the http:// URL from the decoded string.
-          const b64    = streamUrl.replace(/-/g, '+').replace(/_/g, '/');
-          const rawBuf = Buffer.from(b64, 'base64');
-
-          const strategies = [
-            // S0 — plain base64, NO reversal (huavod.net and similar)
-            () => rawBuf.toString('utf8'),
-            // S1 — standard MacCMS v3: latin1 → reverse → decodeURIComponent
-            () => decodeURIComponent(rawBuf.toString('latin1').split('').reverse().join('')),
-            // S2 — reverse raw bytes → UTF-8
-            () => Buffer.from([...rawBuf].reverse()).toString('utf8'),
-            // S3 — UTF-8 string → reverse chars
-            () => rawBuf.toString('utf8').split('').reverse().join(''),
-            // S4 — latin1 → reverse → unescape (old templates using escape())
-            () => unescape(rawBuf.toString('latin1').split('').reverse().join('')),
-            // S5 — plain UTF-8 decode yields a relative path (no protocol)
-            //      e.g. "20240101/abcd1234/index.m3u8" → prepend okokserver domain
-            () => {
-              const decoded = rawBuf.toString('utf8');
-              // Match a relative path: starts with path chars, has at least one slash, ends .m3u8
-              const relMatch = decoded.match(/^[a-zA-Z0-9._\-]+(\/[a-zA-Z0-9._\-]+)+\.m3u8/);
-              if (relMatch) return `https://p.okokserver.com/${relMatch[0]}`;
-              return '';
-            },
-            // S6 — rescue relative m3u8 path from binary soup (reversed or plain)
-            //      e.g. "2/14/name_of_show/file.m3u8" embedded in garbled bytes
-            () => {
-              const binary = rawBuf.toString('binary');
-              const reversed = binary.split('').reverse().join('');
-              // {1,} instead of {2,}: also match single-dir paths like "hash/index.m3u8"
-              const relMatch = reversed.match(/([a-zA-Z0-9_\-]+\/){1,}[a-zA-Z0-9._\-]+\.m3u8/);
-              if (relMatch) return `https://p.okokserver.com/${relMatch[0]}`;
-              const relMatch2 = binary.match(/([a-zA-Z0-9_\-]+\/){1,}[a-zA-Z0-9._\-]+\.m3u8/);
-              if (relMatch2) return `https://p.okokserver.com/${relMatch2[0]}`;
-              return '';
-            },
-          ];
-
-          for (const [i, fn] of strategies.entries()) {
-            try {
-              let candidate = fn();
-              // Extract the first http:// token from the decoded string.
-              // Some templates pad with "O0O0O" junk before/after the URL.
-              const httpMatch = candidate.match(/https?:\/\/[^\s"'<>\\]+/);
-              if (httpMatch) {
-                candidate = httpMatch[0]
-                  .replace(/[O0]{4,}$/, '')
-                  .replace(/[^a-zA-Z0-9._\-/:?=&%+#~@!$'()*,;]+$/, '');
-              }
-              console.log(`[Sniffer] encrypt:3 S${i}: "${candidate.slice(0, 100)}"`);
-              // STRICT check: must be a clean ASCII http URL that contains .m3u8
-              // The old loose check (startsWith('http') || includes('.m3u8')) was
-              // falsely matching garbage binary strings and sending them to the player.
-              if (/^https?:\/\/[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+\.m3u8/.test(candidate)) {
-                streamUrl = candidate;
-                console.log(`[Sniffer] encrypt:3 ✅ S${i} clean URL matched`);
-                break;
-              }
-            } catch(_) {}
-          }
-        }
-
-        // ── Step 3: Unwrap player-wrapper URLs  (?url=<encoded_m3u8>) ──────
-        if (typeof streamUrl === 'string' && streamUrl.includes('url=')) {
-          const m = streamUrl.match(/[?&]url=([^&]+)/);
-          if (m) {
-            const inner = decodeURIComponent(m[1]);
-            // Only accept clean ASCII http URLs
-            if (/^https?:\/\/[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/.test(inner)) streamUrl = inner;
-          }
-        }
-
-        // ── Step 4: HEAD-validate before firing — prevents 404 from reaching the player ─
-        if (streamUrl && /^https?:\/\/[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+\.m3u8/.test(streamUrl)) {
-          sendStatus('🔎 验证流地址…');
-          try {
-            const headRes = await axios.head(streamUrl, {
-              timeout: 6000,
-              headers: { 'Referer': 'https://huavod.net/', 'User-Agent': CHROME_UA },
-              maxRedirects: 5,
-              httpsAgent: new https.Agent({ rejectUnauthorized: false }),
-            });
-            console.log(`[Sniffer] ⚡ Fast extraction HEAD ${headRes.status}: ${streamUrl}`);
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('ipc:m3u8-found', {
-                streamUrl, referer: BASE_URL + '/', userAgent: CHROME_UA,
-              });
-            }
-            cleanupSniffer();
-            return;
-          } catch (headErr) {
-            console.log(`[Sniffer] Fast extraction HEAD FAILED (${headErr.message}) — falling back to sniffer. url: ${streamUrl.slice(0, 80)}`);
-            // fall through to sniffer window
-          }
-        } else {
-          console.log('[Sniffer] Fast extraction: no clean m3u8 found, falling back to sniffer window. Last url:', String(streamUrl).slice(0, 80));
-        }
-      }
-
-      // ── HAIL MARY: scan raw HTML for any m3u8 URL ──────────────────────────
-      const rawM3u8 = html.match(/(https?:\/\/[-A-Za-z0-9+&@#/%?=~_|!:,.;]+(\.m3u8))/i);
-      const b64M3u8 = html.match(/aHR0c[a-zA-Z0-9+/=]+/);
-
-      const hailMaryUrl = rawM3u8?.[1] ?? (() => {
-        try {
-          const dec = Buffer.from(b64M3u8?.[0] ?? '', 'base64').toString('utf8');
-          return dec.includes('.m3u8') ? dec : null;
-        } catch(_) { return null; }
-      })();
-
-      if (hailMaryUrl) {
-        sendStatus('🔎 验证 Hail-Mary 地址…');
-        try {
-          await axios.head(hailMaryUrl, {
-            timeout: 6000,
-            headers: { 'Referer': 'https://huavod.net/', 'User-Agent': CHROME_UA },
-            maxRedirects: 5,
-            httpsAgent: new https.Agent({ rejectUnauthorized: false }),
-          });
-          console.log('[Sniffer] ⚡ Hail-Mary m3u8 validated:', hailMaryUrl);
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('ipc:m3u8-found', {
-              streamUrl: hailMaryUrl, referer: BASE_URL + '/', userAgent: CHROME_UA,
-            });
-          }
-          cleanupSniffer();
-          return;
-        } catch (e) {
-          console.log('[Sniffer] Hail-Mary HEAD failed:', e.message, '— falling back to sniffer');
-        }
-      }
-
-    } catch (e) {
-      console.log('[Sniffer] Fast extraction failed or skipped:', e.message);
-    }
-  }
-
-  sendStatus('🔍 降级开启后台深度嗅探 (过滤广告中)…');
-
-  // ── Hidden browser window ────────────────────────────────────────────────────
+  // 1. 立即启动后台深度嗅探窗口 (Parallel Background Sniffer)
   snifferWin = new BrowserWindow({
     width: 800, height: 600,
     show: false, skipTaskbar: true,
@@ -569,17 +441,25 @@ async function startSniffing(targetUrl) {
       devTools: false,
       javascript: true,
       images: true, // Need to see the page
+      autoplayPolicy: 'user-gesture-required', // 预防后台静默播放声音
     },
   });
   snifferWin.webContents.setAudioMuted(true);
 
-  // ── Request interceptor ──────────────────────────────────────────────────────
+  // ── Request interceptor ──
   const startTime = Date.now();
   session.defaultSession.webRequest.onBeforeRequest(
     { urls: ['<all_urls>'] },
     (details, callback) => {
       const url = details.url;
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+      
+      // 拦截无关资源加速窗口加载
+      const blockTypes = ['image', 'stylesheet', 'font', 'media', 'ping'];
+      if (blockTypes.includes(details.resourceType) && !url.toLowerCase().includes('.m3u8')) {
+        callback({ cancel: true });
+        return;
+      }
       
       // Specifically target okokserver's mp4 video ads and cleanly amputate them from the network
       if (url.includes('okokserver.com') && url.includes('.mp4')) {
@@ -599,69 +479,199 @@ async function startSniffing(targetUrl) {
           return;
         }
 
-        // Mark as pending to prevent duplicate captures while validation is in flight.
-        // If HEAD fails we reset capturedM3u8 so the next m3u8 can be tried.
-        capturedM3u8 = url;
+        const candidateUrl = url;
         const candidateReferer = details.referrer || BASE_URL + '/';
 
-        sendStatus('🔎 验证流地址…');
-        console.log(`[Sniffer] 🔥 Intercepted M3U8 at ${elapsed}s, validating:`, url);
+        console.log(`[Sniffer] ⏳ Verifying intercepted M3U8 at ${elapsed}s:`, candidateUrl);
 
-        // callback({}) is called unconditionally below — the request is allowed through
-        // while we validate asynchronously in the background.
-        ax.head(url, {
-          timeout: 6000,
+        axios.head(candidateUrl, {
+          timeout: 4000, maxRedirects: 4,
           headers: { 'Referer': 'https://huavod.net/', 'User-Agent': CHROME_UA },
-          maxRedirects: 5,
-          httpsAgent: new https.Agent({ rejectUnauthorized: false }),
-        }).then(r => {
-          console.log(`[Sniffer] ✅ M3U8 HEAD ${r.status}:`, url);
-          capturedHeaders = { referer: candidateReferer, userAgent: CHROME_UA };
-          sendStatus('✅ Stream found! Launching player…');
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('ipc:m3u8-found', {
-              streamUrl: url,
-              referer:   BASE_URL + '/',
-              userAgent: CHROME_UA,
-            });
+          httpsAgent: new https.Agent({ rejectUnauthorized: false })
+        }).then(res => {
+          if (res.status >= 200 && res.status < 400 && !capturedM3u8) {
+            capturedM3u8 = candidateUrl;
+            console.log(`[Sniffer] 🔥 Interception verified 200 OK! Sending to renderer:`, candidateUrl);
+            sendStatus('✅ Stream verified! Launching player…');
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('ipc:m3u8-found', {
+                streamUrl: candidateUrl,
+                referer: candidateReferer,
+                userAgent: CHROME_UA,
+              });
+            }
+            if (snifferWin && !snifferWin.isDestroyed()) { snifferWin.destroy(); snifferWin = null; }
+            setImmediate(() => cleanupSniffer());
           }
-          if (snifferWin && !snifferWin.isDestroyed()) { snifferWin.destroy(); snifferWin = null; }
-          setImmediate(() => cleanupSniffer());
-        }).catch(e => {
-          console.log(`[Sniffer] ❌ M3U8 HEAD failed (${e.message}) — resetting, will capture next m3u8. url: ${url.slice(0, 80)}`);
-          capturedM3u8 = null; // allow the next intercepted m3u8 to be tried
+        }).catch(err => {
+          console.log(`[Sniffer] 🚫 Intercepted M3U8 verification failed (404/dead): ${err.message}`);
         });
-      }
 
+        callback({});
+        return;
+      }
       callback({});
     }
   );
 
-  // ── Timeout ──────────────────────────────────────────────────────────────────
+  // ── Timeout ──
   sniffTimeoutId = setTimeout(() => {
     if (!capturedM3u8) {
       sendError('⏱️ Timeout: no stream found in 25 seconds. The source might be dead.');
       cleanupSniffer();
     }
-  }, SNIFF_TIMEOUT_MS);
+  }, 25000);
 
-  // ── Navigate ─────────────────────────────────────────────────────────────────
-  snifferWin.loadURL(finalUrl, { userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" }).catch((err) => {
+  // ── Navigate ──
+  snifferWin.loadURL(finalUrl, { userAgent: CHROME_UA }).catch((err) => {
+    // 忽略因为提前终止 (例如已经成功捕捉到 m3u8 并销毁窗口) 导致的错误
+    if (err.message.includes('ERR_ABORTED')) return;
+    if (capturedM3u8) return;
+    
     sendError(`❌ Failed to load URL: ${err.message}`);
     cleanupSniffer();
   });
 
-  snifferWin.webContents.on('did-finish-load', () => {
-    // Relying on preload_sniffer.js (injected into all frames) to handle skipping.
-  });
+  snifferWin.webContents.on('did-finish-load', () => {});
 
-  snifferWin.webContents.on('did-fail-load', (_e, code) => {
-    if (code === 0 || sniffAborted) return;
+  snifferWin.webContents.on('did-fail-load', (_e, code, desc, validatedUrl, isMainFrame) => {
+    if (code === 0 || sniffAborted || capturedM3u8) return;
     // Non-fatal codes (e.g. blocked resources in hidden window) are fine
     if (Math.abs(code) < 100) return;
+    // 忽略 iframe 或其它子框架的加载失败，只关心主框架
+    if (!isMainFrame) return;
+
     sendError(`❌ Page navigation failed (code ${code}).`);
     cleanupSniffer();
   });
+
+  // 2. 并行执行快速验证 (Fast Extraction with 800ms HEAD)
+  const is4K = (sourceName || '').toUpperCase().includes('4K');
+  if (finalUrl.includes('/vodplay/') && !is4K) {
+    try {
+      const { data: html } = await ax.get(finalUrl);
+
+      let streamUrl = null;
+      let encrypt   = 0;
+
+      const blockMatch = html.match(/mac_player_info\s*=\s*(\{[^\r\n]+\})/);
+      if (blockMatch) {
+        try {
+          const info = JSON.parse(blockMatch[1]);
+          if (info.url) { streamUrl = info.url; encrypt = parseInt(info.encrypt) || 0; }
+        } catch(_) {
+          const um = blockMatch[1].match(/"url"\s*:\s*"([^"]+)"/);
+          const em = blockMatch[1].match(/"encrypt"\s*:\s*(\d+)/);
+          if (um) streamUrl = um[1];
+          if (em) encrypt   = parseInt(em[1]);
+        }
+      }
+      if (!streamUrl) {
+        const um = html.match(/"url"\s*:\s*"([^"]+)"/);
+        const em = html.match(/"encrypt"\s*:\s*(\d+)/);
+        if (um) streamUrl = um[1];
+        if (em) encrypt   = parseInt(em[1]);
+      }
+
+      if (streamUrl) {
+        streamUrl = streamUrl.replace(/\\\//g, '/');
+        if (encrypt === 1) {
+          streamUrl = decodeURIComponent(streamUrl);
+        } else if (encrypt === 2) {
+          streamUrl = decodeURIComponent(escape(Buffer.from(streamUrl, 'base64').toString('binary')));
+        } else if (encrypt === 3 && !streamUrl.startsWith('http')) {
+          const b64 = streamUrl.replace(/-/g, '+').replace(/_/g, '/');
+          const rawBuf = Buffer.from(b64, 'base64');
+          const strategies = [
+            () => rawBuf.toString('utf8'),
+            () => decodeURIComponent(rawBuf.toString('latin1').split('').reverse().join('')),
+            () => Buffer.from([...rawBuf].reverse()).toString('utf8'),
+            () => rawBuf.toString('utf8').split('').reverse().join(''),
+            () => unescape(rawBuf.toString('latin1').split('').reverse().join('')),
+            () => {
+              const relMatch = rawBuf.toString('utf8').match(/^[a-zA-Z0-9._\-]+(\/[a-zA-Z0-9._\-]+)+\.m3u8/);
+              if (relMatch) return `https://p.okokserver.com/${relMatch[0]}`; return '';
+            },
+            () => {
+              const binary = rawBuf.toString('binary');
+              const reversed = binary.split('').reverse().join('');
+              let relMatch = reversed.match(/([a-zA-Z0-9_\-]+\/){1,}[a-zA-Z0-9._\-]+\.m3u8/);
+              if (relMatch) return `https://p.okokserver.com/${relMatch[0]}`;
+              relMatch = binary.match(/([a-zA-Z0-9_\-]+\/){1,}[a-zA-Z0-9._\-]+\.m3u8/);
+              if (relMatch) return `https://p.okokserver.com/${relMatch[0]}`;
+              return '';
+            }
+          ];
+          for (const [i, fn] of strategies.entries()) {
+            try {
+              let candidate = fn();
+              const httpMatch = candidate.match(/https?:\/\/[^\s"'<>\\]+/);
+              if (httpMatch) {
+                candidate = httpMatch[0].replace(/[O0]{4,}$/, '').replace(/[^a-zA-Z0-9._\-/:?=&%+#~@!$'()*,;]+$/, '');
+              }
+              if (/^https?:\/\/[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+\.m3u8/.test(candidate)) {
+                streamUrl = candidate; break;
+              }
+            } catch(_) {}
+          }
+        }
+        if (typeof streamUrl === 'string' && streamUrl.includes('url=')) {
+          const m = streamUrl.match(/[?&]url=([^&]+)/);
+          if (m) {
+            const inner = decodeURIComponent(m[1]);
+            if (/^https?:\/\/[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/.test(inner)) streamUrl = inner;
+          }
+        }
+      }
+
+      const rawM3u8 = html.match(/(https?:\/\/[-A-Za-z0-9+&@#/%?=~_|!:,.;]+(\.m3u8))/i);
+      const b64M3u8 = html.match(/aHR0c[a-zA-Z0-9+/=]+/);
+      const hailMaryUrl = rawM3u8?.[1] ?? (() => {
+        try {
+          const dec = Buffer.from(b64M3u8?.[0] ?? '', 'base64').toString('utf8');
+          return dec.includes('.m3u8') ? dec : null;
+        } catch(_) { return null; }
+      })();
+
+      let candidateUrl = null;
+      if (streamUrl && /^https?:\/\/[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+\.m3u8/.test(streamUrl)) {
+        candidateUrl = streamUrl;
+      } else if (hailMaryUrl) {
+        candidateUrl = hailMaryUrl;
+      }
+
+      // 极速验证 HEAD 且超时设定极短 (800ms)
+      if (candidateUrl && !capturedM3u8) {
+        console.log(`[Sniffer] ⚡ Extracted candidate: ${candidateUrl}, doing 800ms HEAD check...`);
+        try {
+          const headRes = await axios.head(candidateUrl, {
+            timeout: 800,
+            headers: { 'Referer': 'https://huavod.net/', 'User-Agent': CHROME_UA },
+            maxRedirects: 4,
+            httpsAgent: new https.Agent({ rejectUnauthorized: false }),
+          });
+          
+          if (headRes.status >= 200 && headRes.status < 400 && !capturedM3u8) {
+            console.log(`[Sniffer] ⚡ Fast extraction HEAD SUCCESS ${headRes.status}: ${candidateUrl}`);
+            capturedM3u8 = candidateUrl; // 锁定后台嗅探，防止它再发
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('ipc:m3u8-found', { streamUrl: candidateUrl, referer: BASE_URL+'/', userAgent: CHROME_UA });
+            }
+            cleanupSniffer();
+          } else {
+            console.log(`[Sniffer] ⚡ Fast extraction HEAD bad status ${headRes.status} - leaving to background sniffer`);
+          }
+        } catch (e) {
+          console.log(`[Sniffer] ⚡ Fast extraction HEAD failed or timed out (${e.message}) - background sniffer is already analyzing!`);
+        }
+      }
+
+    } catch (e) {
+      console.log('[Sniffer] Fast extraction failed or skipped:', e.message);
+    }
+  } else if (is4K) {
+    console.log(`[Sniffer] 🚫 Fast Extraction disabled specifically for 4K source (${sourceName}).`);
+  }
 }
 
 // ─── IPC Helpers ───────────────────────────────────────────────────────────────
@@ -677,12 +687,16 @@ function sendError(msg) {
 // ─── IPC Handlers ─────────────────────────────────────────────────────────────
 
 // Sniffer
-ipcMain.on('ipc:sniff-url', (_event, url) => {
+ipcMain.on('ipc:sniff-url', (_event, url, sourceName) => {
   if (!url || typeof url !== 'string') { sendError('❌ Invalid URL.'); return; }
-  startSniffing(url);
+  startSniffing(url, sourceName);
 });
 
 ipcMain.on('ipc:stop-sniff', () => {
+  cleanupSniffer();
+});
+
+ipcMain.on('stop-sniffing', () => {
   cleanupSniffer();
 });
 
@@ -704,6 +718,47 @@ ipcMain.handle('ipc:scrape-search', async (_event, { keyword, page }) => {
     console.error('[Scrape] search error:', err.message);
     return { items: [], hasMore: false, error: err.message };
   }
+});
+
+// ─── Dynamic filter options ────────────────────────────────────────────────────
+async function fetchFilterOptions(catId) {
+  try {
+    const { data: html } = await ax.get(`/vodshow/${catId}.html`, { timeout: 10000 });
+    const $ = cheerio.load(html);
+
+    const areas = [];
+    const years = [];
+    const seenAreas = new Set();
+    const seenYears = new Set();
+
+    $('a[href*="/area/"]').each((_i, el) => {
+      const href = $(el).attr('href') || '';
+      const m = href.match(/\/area\/([^./]+)/);
+      if (!m) return;
+      let val;
+      try { val = decodeURIComponent(m[1]); } catch { val = m[1]; }
+      if (val && !seenAreas.has(val)) { seenAreas.add(val); areas.push(val); }
+    });
+
+    $('a[href*="/year/"]').each((_i, el) => {
+      const href = $(el).attr('href') || '';
+      const m = href.match(/\/year\/(\d{4})/);
+      if (!m) return;
+      const val = m[1];
+      if (!seenYears.has(val)) { seenYears.add(val); years.push(val); }
+    });
+
+    years.sort((a, b) => Number(b) - Number(a)); // newest first
+    console.log(`[FilterOptions] cat=${catId} areas=${areas.length} years=${years.length}`);
+    return { areas, years };
+  } catch (err) {
+    console.error('[FilterOptions] error:', err.message);
+    return { areas: [], years: [] };
+  }
+}
+
+ipcMain.handle('ipc:fetch-filter-options', async (_event, catId) => {
+  return fetchFilterOptions(catId);
 });
 
 // Detail: fetch episode list (multi-source anthology structure)
@@ -776,6 +831,44 @@ ipcMain.on('win:maximize', () => {
 ipcMain.on('win:close', () => { cleanupSniffer(); mainWindow?.close(); });
 ipcMain.on('updater:restart', () => autoUpdater?.quitAndInstall());
 
+// ─── Playback History ──────────────────────────────────────────────────────────
+const HISTORY_FILE = path.join(app.getPath('userData'), 'pvp_history.json');
+
+function readHistory() {
+  try {
+    if (fs.existsSync(HISTORY_FILE)) {
+      return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+    }
+  } catch (err) {
+    console.error('[History] Read error:', err.message);
+  }
+  return {};
+}
+
+function writeHistory(data) {
+  try {
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(data), 'utf8');
+  } catch (err) {
+    console.error('[History] Write error:', err.message);
+  }
+}
+
+ipcMain.handle('ipc:get-history', async (_event, vodID) => {
+  const history = readHistory();
+  return history[vodID] || null;
+});
+
+ipcMain.on('ipc:save-history', (_event, record) => {
+  if (!record || !record.vodID) return;
+  const history = readHistory();
+  history[record.vodID] = {
+    episodeIndex: record.episodeIndex,
+    currentTime: record.currentTime,
+    updatedAt: Date.now()
+  };
+  writeHistory(history);
+});
+
 // ─── Auto-Updater ──────────────────────────────────────────────────────────────
 function setupAutoUpdater() {
   if (!autoUpdater) return;
@@ -784,7 +877,10 @@ function setupAutoUpdater() {
 
   autoUpdater.on('checking-for-update',  () => console.log('[Updater] Checking…'));
   autoUpdater.on('update-not-available', () => console.log('[Updater] Up to date.'));
-  autoUpdater.on('error', err           => console.error('[Updater] Error:', err.message));
+  autoUpdater.on('error', err => {
+    console.error('[Updater] Error:', err.message);
+    mainWindow?.webContents.send('updater:error', err.message);
+  });
 
   autoUpdater.on('update-available', info => {
     console.log('[Updater] Update available:', info.version);

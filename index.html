@@ -6,7 +6,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Pure Video Player</title>
   <meta name="description" content="Ad-free Chinese drama & movie streaming portal"/>
-  <link rel="stylesheet" href="vendor/DPlayer.min.css"/>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -126,6 +125,28 @@
     }
     .ep-sort-btn:hover { background: rgba(124,58,237,0.4); color: #fff; }
     .ep-sort-btn.desc { color: #a78bfa; border-color: #7c3aed; }
+
+    /* ── Skip Settings row ── */
+    #skip-settings-row {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap;
+    }
+    .skip-label { color: rgba(255,255,255,0.45); font-size: 12px; white-space: nowrap; }
+    .skip-input {
+      width: 58px; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.13);
+      color: #e8e8f0; border-radius: 6px; padding: 3px 6px; font-size: 12px;
+      text-align: center; outline: none; transition: border-color .2s;
+      -moz-appearance: textfield;
+    }
+    .skip-input::-webkit-inner-spin-button,
+    .skip-input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    .skip-input:focus { border-color: var(--accent); }
+    .skip-unit { color: rgba(255,255,255,0.3); font-size: 12px; }
+    #skip-clear-btn {
+      margin-left: auto; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+      color: rgba(255,255,255,0.4); padding: 3px 10px; border-radius: 6px; cursor: pointer;
+      font-size: 11px; transition: all .15s;
+    }
+    #skip-clear-btn:hover { background: rgba(244,63,94,.15); border-color: rgba(244,63,94,.4); color: var(--danger); }
 
     /* Grid scroll area */
     #grid-scroll { flex: 1; overflow-y: auto; padding: 18px 20px 10px; }
@@ -268,11 +289,25 @@
       border-radius: 20px;
       cursor: pointer;
       font-size: 12.5px;
-      transition: all 0.18s;
+      transition: all 0.2s ease;
       white-space: nowrap;
     }
-    .source-tab:hover { background: rgba(124,58,237,0.4); color: #fff; }
-    .source-tab.active { background: #7c3aed; border-color: #7c3aed; color: #fff; }
+    .source-tab:hover { 
+      background: linear-gradient(135deg, rgba(75,85,99,0.9), rgba(100,116,139,0.6));
+      color: #ffffff; 
+      transform: scale(1.05); 
+      box-shadow: 0 4px 18px rgba(167,139,250,0.6); 
+      border-color: #ffffff;
+      text-shadow: 0 0 8px rgba(255,255,255,0.6);
+    }
+    .source-tab:active { transform: scale(0.95); box-shadow: 0 2px 6px rgba(167,139,250,0.3); }
+    .source-tab.active { background: #7c3aed; border-color: #7c3aed; color: #ffffff; }
+    .source-tab.active:hover { 
+      background: linear-gradient(135deg, #a855f7, #c084fc);
+      border-color: #ffffff; 
+      box-shadow: 0 4px 22px rgba(192,132,252,0.8);
+      text-shadow: 0 0 10px rgba(255,255,255,0.8);
+    }
 
     /* ── HLS quality selector overlay ── */
     .hls-quality-btn {
@@ -325,16 +360,30 @@
     .ep-btn {
       background: rgba(255, 255, 255, 0.1);
       border: 1px solid rgba(255,255,255,0.1);
-      color: #fff;
+      color: #ffffff;
       padding: 8px;
       border-radius: 6px;
       cursor: pointer;
       text-align: center;
       font-size: 13px;
-      transition: all 0.2s;
+      transition: all 0.2s ease;
     }
-    .ep-btn:hover { background: rgba(124, 58, 237, 0.5); }
-    .ep-btn.active { background: #7c3aed; border-color: #7c3aed; }
+    .ep-btn:hover { 
+      background: linear-gradient(135deg, rgba(75,85,99,0.9), rgba(100,116,139,0.6));
+      transform: scale(1.05); 
+      box-shadow: 0 4px 18px rgba(167,139,250,0.6);
+      border-color: #ffffff;
+      color: #ffffff;
+      text-shadow: 0 0 8px rgba(255,255,255,0.6);
+    }
+    .ep-btn:active { transform: scale(0.95); box-shadow: 0 2px 6px rgba(167,139,250,0.3); }
+    .ep-btn.active { background: #7c3aed; border-color: #7c3aed; color: #ffffff; }
+    .ep-btn.active:hover { 
+      background: linear-gradient(135deg, #a855f7, #c084fc);
+      border-color: #ffffff; 
+      box-shadow: 0 4px 22px rgba(192,132,252,0.8);
+      text-shadow: 0 0 10px rgba(255,255,255,0.8);
+    }
 
     .cat-tab.fav-tab { gap: 4px; }
     .cat-tab.fav-tab.active { color: #fbbf24; border-bottom-color: #fbbf24; }
@@ -367,6 +416,70 @@
     .toast.error   { background: rgba(244,63,94,.14); border: 1px solid rgba(244,63,94,.35); color: var(--danger); }
     .toast.success { background: rgba(34,211,238,.12); border: 1px solid rgba(34,211,238,.3); color: var(--success); }
     @keyframes slideIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+
+    /* ── Next Episode Toast ── */
+    #next-countdown-toast {
+      position: absolute; bottom: 80px; right: 20px;
+      background: rgba(20,20,30,0.85); border: 1px solid rgba(124,58,237,0.5);
+      color: #fff; padding: 12px 20px; border-radius: 8px; z-index: 9999;
+      font-size: 14px; display: flex; align-items: center; gap: 12px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.5); backdrop-filter: blur(8px);
+      animation: slideIn .3s ease;
+    }
+    #next-countdown-toast button {
+      border: none; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; transition: background .2s; outline: none;
+    }
+    #cancel-next-btn { background: rgba(255,255,255,0.1); color: #fff; }
+    #cancel-next-btn:hover { background: rgba(255,255,255,0.2); }
+    #play-next-now-btn { background: #7c3aed; color: #fff; }
+    #play-next-now-btn:hover { background: #a855f7; }
+    /* ── DPlayer Right Icons Rearrangement ── */
+    .dplayer-setting { order: 1; }
+    .dplayer-quality { order: 2; }
+    .dplayer-camera-icon { order: 3; }
+    .dplayer-comment-icon { order: 4; }
+    .dplayer-subtitle-icon { order: 5; }
+    
+    .dplayer-icons-right {
+      display: flex !important;
+      align-items: center !important;
+    }
+    
+    /* DPlayer usually wraps full-in and full in a .dplayer-full div */
+    .dplayer-full {
+      order: 99 !important;
+      display: flex !important;
+      align-items: center !important;
+      flex-direction: row !important;
+      position: static !important;
+      margin-left: 5px !important;
+    }
+    
+    /* Reset icon properties, force flex, and clear any absolute / offsets */
+    .dplayer-icons-right .dplayer-icon, .dplayer-full .dplayer-icon {
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      height: 100% !important;
+      position: static !important;
+      top: auto !important;
+      bottom: auto !important;
+      left: auto !important;
+      right: auto !important;
+      margin: 0 !important;
+      transform: none !important;
+    }
+    
+    /* Explicit ordering for the two fullscreen buttons */
+    .dplayer-full .dplayer-full-in-icon,
+    .dplayer-icons-right > .dplayer-full-in-icon { 
+      order: 1 !important; 
+      margin-right: 6px !important; 
+    }
+    .dplayer-full .dplayer-full-icon,
+    .dplayer-icons-right > .dplayer-full-icon { 
+      order: 2 !important; 
+    }
   </style>
 </head>
 <body>
@@ -418,44 +531,24 @@
         </div>
       </div>
 
-      <!-- ── Filter bar (area + year) ── -->
+      <!-- ── Filter bar (subcat + area + year) ── -->
       <div id="filter-bar" class="hidden">
+        <div class="filter-row" id="subcat-row" style="display:none;">
+          <span class="filter-label">分类</span>
+          <div class="filter-chips" id="subcat-chips">
+            <!-- Populated dynamically by renderSubcatRow() -->
+          </div>
+        </div>
         <div class="filter-row" id="area-row">
           <span class="filter-label">地区</span>
           <div class="filter-chips" id="area-chips">
             <button class="filter-chip active" data-val="">全部</button>
-            <button class="filter-chip" data-val="大陆">大陆</button>
-            <button class="filter-chip" data-val="香港">香港</button>
-            <button class="filter-chip" data-val="台湾">台湾</button>
-            <button class="filter-chip" data-val="美国">美国</button>
-            <button class="filter-chip" data-val="韩国">韩国</button>
-            <button class="filter-chip" data-val="日本">日本</button>
-          </div>
-        </div>
-        <div class="filter-row" id="genre-row" style="display: none;">
-          <span class="filter-label">流派</span>
-          <div class="filter-chips" id="genre-chips">
-            <button class="filter-chip active" data-val="">全部</button>
-            <button class="filter-chip" data-val="动作">动作</button>
-            <button class="filter-chip" data-val="喜剧">喜剧</button>
-            <button class="filter-chip" data-val="爱情">爱情</button>
-            <button class="filter-chip" data-val="科幻">科幻</button>
-            <button class="filter-chip" data-val="悬疑">悬疑</button>
-            <button class="filter-chip" data-val="战争">战争</button>
-            <button class="filter-chip" data-val="动画">动画</button>
           </div>
         </div>
         <div class="filter-row">
           <span class="filter-label">年份</span>
           <div class="filter-chips" id="year-chips">
             <button class="filter-chip active" data-val="">全部</button>
-            <button class="filter-chip" data-val="2026">2026</button>
-            <button class="filter-chip" data-val="2025">2025</button>
-            <button class="filter-chip" data-val="2024">2024</button>
-            <button class="filter-chip" data-val="2023">2023</button>
-            <button class="filter-chip" data-val="2022">2022</button>
-            <button class="filter-chip" data-val="2021">2021</button>
-            <button class="filter-chip" data-val="2020">2020</button>
           </div>
         </div>
       </div>
@@ -506,13 +599,22 @@
             <p>从目录点击影片卡片，或在上方直接粘贴链接后点击"播放"。</p>
           </div>
         </div>
-        <div id="dplayer"></div>
+        <div id="artplayer" style="width:100%; height:100%;"></div>
       </div>
       <!-- Episode List Container -->
       <div id="episode-list-container" class="episode-list-container hidden">
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
           <span style="color:rgba(255,255,255,0.6); font-size:14px; font-weight:500;">选集列表</span>
           <button id="ep-sort-btn" class="ep-sort-btn">排序 ⇅</button>
+        </div>
+        <div id="skip-settings-row">
+          <span class="skip-label">⏩ 片头</span>
+          <input type="number" id="skip-op-input" class="skip-input" min="0" max="600" value="0"/>
+          <span class="skip-unit">秒</span>
+          <span class="skip-label" style="margin-left:8px;">⏪ 片尾</span>
+          <input type="number" id="skip-ed-input" class="skip-input" min="0" max="600" value="0"/>
+          <span class="skip-unit">秒</span>
+          <button id="skip-clear-btn">清空设置</button>
         </div>
         <div id="source-tab-bar" class="source-tab-bar hidden"></div>
         <div id="episode-grid" class="episode-grid"></div>
@@ -522,8 +624,8 @@
   </div><!-- /views -->
 </div>
 
-<script src="vendor/hls.min.js"></script>
-<script src="vendor/DPlayer.min.js"></script>
+<script src="node_modules/hls.js/dist/hls.min.js"></script>
+<script src="node_modules/artplayer/dist/artplayer.js"></script>
 <script src="renderer.js"></script>
 </body>
 </html>
