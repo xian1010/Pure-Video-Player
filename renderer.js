@@ -166,10 +166,22 @@ if (!isElectron) {
       _sniffController = new AbortController();
       sniffBus.dispatchEvent(new CustomEvent('status', { detail: '⏳ 正在提取播放源…' }));
       try {
-        const res = await fetch(`${WORKER_URL}/extract?url=${encodeURIComponent(vodUrl)}`, { signal: _sniffController.signal });
-        const { streamUrl, error } = await res.json();
-        if (error) throw new Error(error);
-        sniffBus.dispatchEvent(new CustomEvent('m3u8-found', { detail: { streamUrl } }));
+        const res  = await fetch(`${WORKER_URL}/extract?url=${encodeURIComponent(vodUrl)}`, { signal: _sniffController.signal });
+        const data = await res.json();
+        if (data.error) {
+          // Worker failed — if it returned a candidateUrl, try direct iPad play
+          // (iPad's real IP bypasses Cloudflare IP blocking on the CDN).
+          if (data.candidateUrl && isIOS) {
+            console.warn('[Fallback] Worker 404/403 — trying direct iPad play:', data.candidateUrl);
+            sniffBus.dispatchEvent(new CustomEvent('status', { detail: '⚡ 切换直连模式…' }));
+            sniffBus.dispatchEvent(new CustomEvent('m3u8-found', {
+              detail: { streamUrl: data.candidateUrl, direct: true },
+            }));
+            return;
+          }
+          throw new Error(data.error);
+        }
+        sniffBus.dispatchEvent(new CustomEvent('m3u8-found', { detail: { streamUrl: data.streamUrl } }));
       } catch (err) {
         if (err.name !== 'AbortError') {
           sniffBus.dispatchEvent(new CustomEvent('sniff-error', { detail: err.message }));
@@ -990,7 +1002,7 @@ function setPlayerLoading(on) {
   playerUrlInput.disabled = on;
 }
 
-function launchPlayer(streamUrl) {
+function launchPlayer(streamUrl, skipProxy = false) {
   isIosLoading = false; // reset lock — new episode cancels any in-flight iOS preflight
   iosLoadTs    = 0;
   if (dpInstance) {
@@ -1004,9 +1016,9 @@ function launchPlayer(streamUrl) {
   if (_artEl) _artEl.innerHTML = '';
   playerPlaceholder.classList.add('hidden');
 
-  // In web / iOS mode route the m3u8 through the Worker proxy so all segment
-  // requests also go through /proxy with correct Referer + CORS headers.
-  const playUrl = isElectron
+  // Direct mode: use raw CDN URL (iPad's real IP, bypasses Cloudflare IP blocking).
+  // Proxy mode:  route through Worker so CORS + Referer headers are injected.
+  const playUrl = (isElectron || skipProxy)
     ? streamUrl
     : `${WORKER_URL}/proxy?url=${encodeURIComponent(streamUrl)}&referer=${encodeURIComponent('https://huavod.net/')}`;
 
@@ -1101,24 +1113,31 @@ function launchPlayer(streamUrl) {
           if (debugEl) { debugEl.style.display = 'block'; debugEl.textContent = '[Debug] iOS preflight check…'; }
 
           (async () => {
-            try {
-              const check = await fetch(proxyUrl);
-              if (!check.ok) {
-                const body = await check.text().catch(() => '');
-                console.error(`[Worker Error] Source status: ${check.status} — ${body.slice(0, 300)}`);
-                if (debugEl) { debugEl.style.display = 'block'; debugEl.textContent = `[Debug] Worker status ${check.status}`; }
+            // Skip preflight in direct mode — raw CDN URLs don't have CORS headers
+            // so a JS fetch() would fail. Safari's <video> doesn't enforce CORS.
+            const isDirect = !url.includes(WORKER_URL);
+            if (!isDirect) {
+              try {
+                const check = await fetch(proxyUrl);
+                if (!check.ok) {
+                  const body = await check.text().catch(() => '');
+                  console.error(`[Worker Error] Source status: ${check.status} — ${body.slice(0, 300)}`);
+                  if (debugEl) { debugEl.style.display = 'block'; debugEl.textContent = `[Debug] Worker status ${check.status}`; }
+                  isIosLoading = false;
+                  return;
+                }
+                const ct = check.headers.get('content-type') || '';
+                console.log(`[iOS] preflight OK ct=${ct}`);
+                if (!ct.includes('mpegurl') && !ct.includes('m3u8')) {
+                  console.warn(`[iOS] unexpected m3u8 content-type: ${ct}`);
+                }
+              } catch (e) {
+                console.error('[iOS] preflight fetch error:', e.message);
                 isIosLoading = false;
                 return;
               }
-              const ct = check.headers.get('content-type') || '';
-              console.log(`[iOS] preflight OK ct=${ct}`);
-              if (!ct.includes('mpegurl') && !ct.includes('m3u8')) {
-                console.warn(`[iOS] unexpected m3u8 content-type: ${ct}`);
-              }
-            } catch (e) {
-              console.error('[iOS] preflight fetch error:', e.message);
-              isIosLoading = false;
-              return;
+            } else {
+              console.log('[iOS] direct mode — skipping CORS preflight');
             }
 
             console.log('[iOS] assigning proxy src =', proxyUrl);
@@ -1367,12 +1386,12 @@ function triggerSniff(url, sourceName = '') {
   window.electronAPI.onStatusUpdate(msg => {
     if (state.view === 'player') setPlayerStatus(msg, 'loading');
   });
-  window.electronAPI.onM3u8Found(({ streamUrl }) => {
+  window.electronAPI.onM3u8Found(({ streamUrl, direct }) => {
     if (state.view !== 'player') return; // Guard against rogue ghost sniff returns!
     isSniffing = false;
     setPlayerLoading(false);
-    setPlayerStatus('✅ 正在播放', 'success');
-    launchPlayer(streamUrl);
+    setPlayerStatus(direct ? '⚡ 直连模式' : '✅ 正在播放', 'success');
+    launchPlayer(streamUrl, direct || false);
     setTimeout(clearPlayerStatus, 3000);
   });
   window.electronAPI.onSniffError(msg => {

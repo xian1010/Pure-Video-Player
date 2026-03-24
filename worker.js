@@ -1,28 +1,38 @@
 /**
- * Cloudflare Worker — Pure Video Player backend proxy  (version 2025-f)
+ * Cloudflare Worker — Pure Video Player backend proxy  (version 2025-g)
  *
  * Routes:
  *   GET /test                             → { ok, version }
- *   GET /extract?url=<vodplay_url>        → { streamUrl } or { error }
- *   GET /proxy?url=<encoded_url>          → transparent proxy (M3U8 / TS / Range)
+ *   GET /extract?url=<vodplay_url>        → { streamUrl } or { error, candidateUrl }
+ *   GET /proxy?url=<encoded_url>          → transparent proxy + Range passthrough
  *   GET /api/page?path=<url_path>         → raw HTML with CORS
  *   GET /api/search?q=<kw>&page=<n>       → { items, hasMore }
  *
- * KEY FIX (2025-f): Range request passthrough for iOS native HLS.
- *   Safari sends  Range: bytes=X-Y  for every TS segment.
- *   We forward it upstream and relay Content-Range / Accept-Ranges back.
- *   Without this, iOS spins forever on "waiting for segment".
+ * 2025-g fixes:
+ *   • /lay/ → /link/ hard-fix for p.okokserver.com (path-variant priority)
+ *   • Session cookies from vodplay page forwarded to CDN fetch
+ *   • candidateUrl returned in error response so renderer can try direct iPad play
+ *   • Range passthrough (from 2025-f, unchanged)
  */
 
 const ORIGIN = 'https://huavod.net';
 
-// Desktop Chrome UA
+// Standard Windows desktop Chrome — CDNs often restrict or downgrade mobile UAs
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
            'AppleWebKit/537.36 (KHTML, like Gecko) ' +
            'Chrome/124.0.0.0 Safari/537.36';
 
-// MacCMS path variants to try on 404/403
-const PATH_VARIANTS = ['/lay/', '/link/', '/play/', '/m3u8/', '/hls/'];
+// ── Hard-fix known bad paths before any fetch attempt ────────────────────────
+// p.okokserver.com uses /link/ for real streams; /lay/ is the MacCMS preview alias.
+function fixStreamPath(url) {
+  if (url.includes('okokserver.com') && url.includes('/lay/')) {
+    return url.replace('/lay/', '/link/');
+  }
+  return url;
+}
+
+// Generic path variants to rotate through on 404/403
+const PATH_VARIANTS = ['/link/', '/lay/', '/play/', '/m3u8/', '/hls/'];
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
 const CORS = {
@@ -40,40 +50,48 @@ function jsonResp(obj, status = 200) {
   return corsResponse(JSON.stringify(obj), status, { 'Content-Type': 'application/json' });
 }
 
-// ── Spoofed headers for huavod.net page requests ──────────────────────────────
+// ── Full-spoof headers for huavod.net page requests ───────────────────────────
 function pageHeaders(extra = {}) {
   return {
-    'User-Agent':      UA,
-    'Referer':         ORIGIN + '/',
-    'Origin':          ORIGIN,
-    'Host':            'huavod.net',
-    'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Cache-Control':   'no-cache',
-    'Pragma':          'no-cache',
+    'User-Agent':        UA,
+    'Referer':           ORIGIN + '/',
+    'Origin':            ORIGIN,
+    'Host':              'huavod.net',
+    'Accept':            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language':   'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Accept-Encoding':   'gzip, deflate, br',
+    'Connection':        'keep-alive',
+    'Cache-Control':     'no-cache',
+    'Pragma':            'no-cache',
+    'Sec-Fetch-Dest':    'document',
+    'Sec-Fetch-Mode':    'navigate',
+    'Sec-Fetch-Site':    'same-origin',
     ...extra,
   };
 }
 
-// ── CDN fetch headers — spoofed Referer + optional Cookie + optional Range ────
+// ── CDN segment/m3u8 fetch headers ────────────────────────────────────────────
 function cdnHeaders(referer, cookies, rangeHeader) {
   const h = {
-    'User-Agent': UA,
-    'Referer':    referer || ORIGIN + '/',
-    'Origin':     ORIGIN,
-    'Accept':     '*/*',
+    'User-Agent':      UA,
+    'Referer':         referer || ORIGIN + '/',
+    'Origin':          ORIGIN,
+    'Accept':          '*/*',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Connection':      'keep-alive',
   };
   if (cookies)     h['Cookie'] = cookies;
-  if (rangeHeader) h['Range']  = rangeHeader;   // ← RANGE PASSTHROUGH
+  if (rangeHeader) h['Range']  = rangeHeader;
   return h;
 }
 
-// ── Fetch huavod.net page; capture Set-Cookie for session simulation ──────────
+// ── Fetch huavod.net page; capture Set-Cookie for session passthrough ─────────
 async function siteFetch(url, extra = {}) {
   const fullUrl = url.startsWith('http') ? url : ORIGIN + url;
   const res = await fetch(fullUrl, { headers: pageHeaders(extra) });
   if (!res.ok) throw new Error(`HTTP ${res.status} from ${fullUrl}`);
 
+  // Collapse multiple Set-Cookie values into a single Cookie string
   const rawCookie = res.headers.get('set-cookie') || '';
   const cookies   = rawCookie
     .split(/,(?=[^;]+=[^;])/)
@@ -84,8 +102,10 @@ async function siteFetch(url, extra = {}) {
   return { text: await res.text(), cookies };
 }
 
-// ── Fetch URL with automatic path-variant fallback on 404/403 ────────────────
-async function fetchWithPathFallback(url, referer, cookies, rangeHeader) {
+// ── Fetch URL; hard-fix path then rotate variants on 404/403 ─────────────────
+async function fetchWithFallback(rawUrl, referer, cookies, rangeHeader) {
+  // Apply hard-fix first so we always try the corrected URL before anything else
+  const url     = fixStreamPath(rawUrl);
   const headers = cdnHeaders(referer, cookies, rangeHeader);
 
   let res = await fetch(url, { headers });
@@ -93,6 +113,7 @@ async function fetchWithPathFallback(url, referer, cookies, rangeHeader) {
 
   const firstStatus = res.status;
 
+  // Path-variant rotation — only on 404/403
   if (firstStatus === 404 || firstStatus === 403) {
     for (const from of PATH_VARIANTS) {
       if (!url.includes(from)) continue;
@@ -166,11 +187,14 @@ function decrypt(raw, enc) {
   return raw;
 }
 
-// ── Extract + verify stream URL from vodplay page ─────────────────────────────
+// ── Extract stream URL from vodplay page ──────────────────────────────────────
 async function extractStreamUrl(vodplayUrl) {
   const url = vodplayUrl.replace(/\/voddetail\/(\d+)\.html/, '/vodplay/$1-1-1.html');
+
+  // Fetch page + capture session cookies
   const { text: html, cookies: sessionCookies } = await siteFetch(url);
 
+  // Parse mac_player_info block
   let blockMatch = html.match(/mac_player_info\s*=\s*(\{[^\r\n]+\})/);
   if (!blockMatch) blockMatch = html.match(/mac_player_info\s*=\s*(\{[\s\S]*?\})\s*;/);
 
@@ -202,6 +226,7 @@ async function extractStreamUrl(vodplayUrl) {
     }
   }
 
+  // Hail-mary: scan HTML for bare m3u8 URL
   if (!streamUrl) {
     const rm = html.match(/(https?:\/\/[-A-Za-z0-9+&@#/%?=~_|!:,.;]+\.m3u8)/i);
     if (rm) {
@@ -217,19 +242,27 @@ async function extractStreamUrl(vodplayUrl) {
   if (!streamUrl || !M3U8_RE.test(streamUrl)) {
     throw Object.assign(
       new Error('No valid m3u8 found after decryption'),
-      { htmlPreview: html.substring(0, 500) }
+      { htmlPreview: html.substring(0, 500), candidateUrl: null }
     );
   }
 
-  // Verify URL works (with session cookies + path-variant fallback)
-  const { finalUrl, status: failStatus } = await fetchWithPathFallback(
-    streamUrl, ORIGIN + '/', sessionCookies, null
+  // Apply hard-fix before verification
+  const fixedUrl = fixStreamPath(streamUrl);
+
+  // Verify the URL actually responds (with session cookies + path fallback)
+  const { finalUrl, status: failStatus } = await fetchWithFallback(
+    fixedUrl, ORIGIN + '/', sessionCookies, null
   );
 
   if (failStatus) {
+    // Return the best-guess URL as candidateUrl so the client can attempt
+    // a direct iPad play (bypassing Cloudflare IPs entirely).
     throw Object.assign(
-      new Error(`Stream URL returned ${failStatus} (tried path variants)`),
-      { htmlPreview: `Attempted: ${streamUrl}\nCookies: ${sessionCookies ? 'yes' : 'no'}` }
+      new Error(`Stream URL returned ${failStatus} (tried all path variants)`),
+      {
+        htmlPreview:  `Original: ${streamUrl}\nFixed: ${fixedUrl}\nCookies: ${sessionCookies ? 'yes' : 'no'}`,
+        candidateUrl: fixedUrl,   // ← renderer uses this for direct iPad fallback
+      }
     );
   }
 
@@ -246,7 +279,7 @@ function rewriteM3u8(text, workerBase, m3u8Url) {
   }).join('\n');
 }
 
-// ── Infer Content-Type from URL extension ─────────────────────────────────────
+// ── Content-Type inference ────────────────────────────────────────────────────
 function inferContentType(upstreamCt, targetUrl) {
   if (/\.(ts)(\?|$)/i.test(targetUrl))                return 'video/mp2t';
   if (/\.m3u8(\?|$)/i.test(targetUrl))               return 'application/vnd.apple.mpegurl';
@@ -263,26 +296,20 @@ async function handle(req) {
   const u    = new URL(req.url);
   const path = u.pathname;
 
-  // ── CORS preflight ────────────────────────────────────────────────────────
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: CORS });
   }
 
-  // ── HEAD /proxy ───────────────────────────────────────────────────────────
   if (req.method === 'HEAD' && path === '/proxy') {
     return new Response(null, {
       status: 200,
-      headers: {
-        ...CORS,
-        'Content-Type':  'application/vnd.apple.mpegurl',
-        'Accept-Ranges': 'bytes',
-      },
+      headers: { ...CORS, 'Content-Type': 'application/vnd.apple.mpegurl', 'Accept-Ranges': 'bytes' },
     });
   }
 
   // ── /test ─────────────────────────────────────────────────────────────────
   if (path === '/test') {
-    return jsonResp({ ok: true, version: '2025-f', origin: ORIGIN });
+    return jsonResp({ ok: true, version: '2025-g', origin: ORIGIN });
   }
 
   // ── /extract ──────────────────────────────────────────────────────────────
@@ -293,7 +320,12 @@ async function handle(req) {
       const streamUrl = await extractStreamUrl(vodUrl);
       return jsonResp({ streamUrl });
     } catch (err) {
-      return jsonResp({ error: err.message, htmlPreview: err.htmlPreview || null }, 502);
+      // Include candidateUrl so renderer.js can attempt a direct iPad play
+      return jsonResp({
+        error:        err.message,
+        htmlPreview:  err.htmlPreview  || null,
+        candidateUrl: err.candidateUrl || null,
+      }, 502);
     }
   }
 
@@ -301,14 +333,13 @@ async function handle(req) {
   if (path === '/proxy') {
     const target      = u.searchParams.get('url');
     const referer     = u.searchParams.get('ref') || u.searchParams.get('referer') || ORIGIN + '/';
-    // ↓ Forward Range header from Safari/iOS verbatim to the CDN
     const rangeHeader = req.headers.get('Range') || null;
 
     if (!target) return jsonResp({ error: 'Missing url param' }, 400);
 
     let upstream, finalTarget;
     try {
-      const result = await fetchWithPathFallback(target, referer, null, rangeHeader);
+      const result = await fetchWithFallback(target, referer, null, rangeHeader);
       upstream    = result.res;
       finalTarget = result.finalUrl;
       if (!upstream) {
@@ -317,12 +348,9 @@ async function handle(req) {
           target,
           finalTarget,
           referer,
-          rangeHeader,
           hint: result.status === 403
-            ? 'CDN blocking Cloudflare IPs or Referer mismatch'
-            : result.status === 404
-            ? 'Segment not found — tried /lay/ /link/ /play/ variants'
-            : 'Upstream error',
+            ? 'CDN blocking Cloudflare IPs — use direct iPad fallback'
+            : 'Segment not found after path variants',
         }, result.status);
       }
     } catch (err) {
@@ -331,34 +359,28 @@ async function handle(req) {
 
     const upstreamCt = upstream.headers.get('content-type') || '';
     const ct         = inferContentType(upstreamCt, finalTarget);
+    const upstreamStatus = upstream.status; // relay 200 or 206
 
-    // ── Collect headers to relay back (Range-related are mandatory for iOS) ─
-    const relayHeaders = { 'Content-Type': ct };
+    // Relay Range-related headers (mandatory for iOS native HLS)
+    const relay = { 'Content-Type': ct };
+    relay['Accept-Ranges'] = upstream.headers.get('Accept-Ranges') || 'bytes';
+    const cr = upstream.headers.get('Content-Range');
+    const cl = upstream.headers.get('Content-Length');
+    if (cr) relay['Content-Range'] = cr;
+    if (cl) relay['Content-Length'] = cl;
 
-    const contentRange  = upstream.headers.get('Content-Range');
-    const acceptRanges  = upstream.headers.get('Accept-Ranges');
-    const contentLength = upstream.headers.get('Content-Length');
-    // Always advertise byte-range support even if CDN didn't send Accept-Ranges
-    relayHeaders['Accept-Ranges'] = acceptRanges || 'bytes';
-    if (contentRange)  relayHeaders['Content-Range']  = contentRange;
-    if (contentLength) relayHeaders['Content-Length'] = contentLength;
-
-    // Use the upstream's actual status: 200 for full, 206 for partial content
-    const upstreamStatus = upstream.status;
-
-    // ── Binary segments ───────────────────────────────────────────────────
+    // Binary segments
     const isBinary = ct.startsWith('video/') || ct.startsWith('audio/') ||
                      upstreamCt.includes('octet-stream') ||
                      /\.(ts|mp4|m4s|m4v|aac|mp3|fmp4)(\?|$)/i.test(finalTarget);
     if (isBinary) {
       const body = await upstream.arrayBuffer();
-      // Override Content-Length with actual body size (some CDNs lie)
-      relayHeaders['Content-Length'] = String(body.byteLength);
-      relayHeaders['Cache-Control']  = 'public, max-age=3600';
-      return corsResponse(body, upstreamStatus, relayHeaders);
+      relay['Content-Length'] = String(body.byteLength);
+      relay['Cache-Control']  = 'public, max-age=3600';
+      return corsResponse(body, upstreamStatus, relay);
     }
 
-    // ── Text — detect M3U8 ────────────────────────────────────────────────
+    // M3U8 detection
     const text   = await upstream.text();
     const isM3u8 = upstreamCt.includes('mpegurl') || upstreamCt.includes('x-mpegurl') ||
                    /\.m3u8(\?|$)/i.test(finalTarget) ||
@@ -374,9 +396,7 @@ async function handle(req) {
       });
     }
 
-    return corsResponse(text, upstreamStatus, {
-      'Content-Type': upstreamCt || 'text/plain',
-    });
+    return corsResponse(text, upstreamStatus, { 'Content-Type': upstreamCt || 'text/plain' });
   }
 
   // ── /api/page ─────────────────────────────────────────────────────────────
@@ -408,7 +428,7 @@ async function handle(req) {
         poster: (v.vod_pic || v.pic || '').startsWith('http')
           ? (v.vod_pic || v.pic)
           : (v.vod_pic || v.pic ? ORIGIN + (v.vod_pic || v.pic) : ''),
-        badge: '',
+        badge:  '',
       })).filter(v => v.title && v.url);
       return jsonResp({ items, hasMore: Number(page) < (data.pagecount || 1) });
     } catch (err) {
