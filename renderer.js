@@ -7,6 +7,31 @@ const isIOS = !isElectron && (
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
 );
 
+// ─── Screen console (intercepts errors → visible on iPad, no F12 needed) ───
+if (!isElectron) {
+  const _dbgEl = document.getElementById('debug-log');
+  const _dbgLines = [];
+  function _dbgPush(msg, color) {
+    const t = new Date().toISOString().slice(11, 22);
+    _dbgLines.push(`<span style="color:#6b7280">[${t}]</span> <span style="color:${color}">${
+      String(msg).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    }</span>`);
+    if (_dbgLines.length > 30) _dbgLines.shift();
+    _dbgEl.innerHTML = _dbgLines.join('<br>');
+    _dbgEl.style.display = 'block';
+  }
+  const _ce = console.error.bind(console);
+  console.error = (...a) => { _ce(...a); _dbgPush(a.map(String).join(' '), '#f87171'); };
+  const _cw = console.warn.bind(console);
+  console.warn  = (...a) => { _cw(...a);  _dbgPush(a.map(String).join(' '), '#fbbf24'); };
+  const _cl = console.log.bind(console);
+  console.log   = (...a) => { _cl(...a);  _dbgPush(a.map(String).join(' '), '#86efac'); };
+  window.onerror = (msg, src, line) =>
+    _dbgPush(`ERR: ${msg} @ ${src}:${line}`, '#f87171');
+  window.onunhandledrejection = (e) =>
+    _dbgPush(`UNHANDLED: ${e.reason}`, '#fb923c');
+}
+
 // ── Cloudflare Worker base URL (only used in web / iPad mode) ─────────────────
 // Replace with your deployed worker URL before publishing the web build.
 const WORKER_URL = 'https://pure-video-proxy.yapshiuxian.workers.dev';
@@ -1053,7 +1078,23 @@ function launchPlayer(streamUrl) {
     ],
     customType: {
       m3u8: function (video, url, art) {
-        if (Hls.isSupported()) {
+        if (isIOS) {
+          // iOS: bypass HLS.js entirely — use Safari's built-in HLS decoder.
+          // The proxy URL already carries CORS + Referer for every segment.
+          console.log('[iOS] native HLS src =', url);
+          if (debugEl) { debugEl.style.display = 'block'; debugEl.textContent = '[Debug] iOS native HLS loading…'; }
+          video.src = url;
+          video.load();
+          video.addEventListener('canplay', () => {
+            console.log('[iOS] canplay fired — playback ready');
+            if (debugEl) debugEl.style.display = 'none';
+          }, { once: true });
+          video.addEventListener('error', () => {
+            const e = video.error;
+            console.error('[iOS] video error code=' + (e && e.code) + ' msg=' + (e && e.message));
+            if (debugEl) { debugEl.style.display = 'block'; debugEl.textContent = '[Debug] video.error code=' + (e && e.code); }
+          }, { once: true });
+        } else if (Hls.isSupported()) {
           const hls = new Hls({
             enableWorker: true,
             fragLoadingMaxRetry: 10,

@@ -483,6 +483,15 @@
   </style>
 </head>
 <body>
+<!-- ── Screen console: hidden until errors fire (web/iPad debug only) ─── -->
+<div id="debug-log" style="
+  display:none; position:fixed; top:0; left:0; right:0; z-index:99999;
+  max-height:40vh; overflow-y:auto; padding:8px 10px;
+  background:rgba(10,0,0,.88); color:#f87171;
+  font-size:11px; font-family:monospace; line-height:1.6;
+  border-bottom:1px solid #7f1d1d;
+  -webkit-overflow-scrolling:touch;
+"></div>
 <div id="app">
 
   <!-- ── Title bar ────────────────────────────────────────────────────────── -->
@@ -624,8 +633,8 @@
   </div><!-- /views -->
 </div>
 
-<script src="node_modules/hls.js/dist/hls.min.js"></script>
-<script src="node_modules/artplayer/dist/artplayer.js"></script>
+<script src="vendor/hls.min.js"></script>
+<script src="https://unpkg.com/artplayer/dist/artplayer.js"></script>
 <script src="renderer.js"></script>
 </body>
 </html>

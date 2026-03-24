@@ -13,9 +13,10 @@
 const ORIGIN    = 'https://huavod.net';
 const UA        = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 const CORS_HDRS = {
-  'Access-Control-Allow-Origin':  '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Origin':   '*',
+  'Access-Control-Allow-Methods':  'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers':  '*',
+  'Access-Control-Expose-Headers': '*',
 };
 
 function cors(body, init = {}) {
