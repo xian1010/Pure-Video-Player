@@ -1075,44 +1075,43 @@ function launchPlayer(streamUrl) {
     customType: {
       m3u8: function (video, url, art) {
         if (isIOS) {
-          // iOS: bypass HLS.js — use Safari native HLS.
-          // Try direct CDN URL first (no proxy); fall back to proxied URL if CDN
-          // blocks Cloudflare IPs or the segment fetch fails (error code 2).
-          const directUrl = streamUrl; // raw CDN m3u8
-          const proxyUrl  = url;       // worker-proxied m3u8
-
-          let triedProxy = false;
-          function tryProxy() {
-            if (triedProxy) return;
-            triedProxy = true;
-            console.log('[iOS] direct failed — trying proxy:', proxyUrl);
-            if (debugEl) debugEl.textContent = '[Debug] iOS proxy HLS loading…';
+          // iOS: bypass HLS.js — use Safari native HLS via Worker proxy.
+          // Preflight: fetch the proxied M3U8 via JS first so any upstream
+          // 403/404 is visible in the screen console before handing off to <video>.
+          const proxyUrl = url;
+          if (debugEl) { debugEl.style.display = 'block'; debugEl.textContent = '[Debug] iOS preflight check…'; }
+          (async () => {
+            try {
+              const check = await fetch(proxyUrl);
+              if (!check.ok) {
+                const body = await check.text().catch(() => '');
+                console.error(`[Worker Error] Source status: ${check.status} — ${body.slice(0, 300)}`);
+                if (debugEl) { debugEl.style.display = 'block'; debugEl.textContent = `[Debug] Worker status ${check.status}`; }
+              } else {
+                const ct = check.headers.get('content-type') || '';
+                console.log(`[iOS] preflight OK ct=${ct}`);
+                if (!ct.includes('mpegurl') && !ct.includes('m3u8')) {
+                  console.warn(`[iOS] unexpected m3u8 content-type: ${ct}`);
+                }
+              }
+            } catch (e) {
+              console.error('[iOS] preflight fetch error:', e.message);
+            }
+            // Assign to <video> regardless — let Safari handle any retry/redirect
+            console.log('[iOS] assigning proxy src =', proxyUrl);
+            if (debugEl) debugEl.textContent = '[Debug] iOS native HLS loading…';
             video.src = proxyUrl;
             video.load();
             video.addEventListener('canplay', () => {
-              console.log('[iOS] proxy canplay — playback ready');
+              console.log('[iOS] canplay — playback ready');
               if (debugEl) debugEl.style.display = 'none';
             }, { once: true });
             video.addEventListener('error', () => {
               const e = video.error;
-              console.error('[iOS] proxy error code=' + (e && e.code) + ' msg=' + (e && e.message));
-              if (debugEl) { debugEl.style.display = 'block'; debugEl.textContent = '[Debug] proxy error code=' + (e && e.code); }
+              console.error('[iOS] video error code=' + (e && e.code) + ' msg=' + (e && e.message));
+              if (debugEl) { debugEl.style.display = 'block'; debugEl.textContent = '[Debug] video.error code=' + (e && e.code); }
             }, { once: true });
-          }
-
-          console.log('[iOS] direct HLS src =', directUrl);
-          if (debugEl) { debugEl.style.display = 'block'; debugEl.textContent = '[Debug] iOS direct HLS loading…'; }
-          video.src = directUrl;
-          video.load();
-          video.addEventListener('canplay', () => {
-            console.log('[iOS] direct canplay — playback ready');
-            if (debugEl) debugEl.style.display = 'none';
-          }, { once: true });
-          video.addEventListener('error', () => {
-            const e = video.error;
-            console.warn('[iOS] direct failed code=' + (e && e.code) + ' — trying proxy');
-            tryProxy();
-          }, { once: true });
+          })();
         } else if (Hls.isSupported()) {
           const hls = new Hls({
             enableWorker: true,

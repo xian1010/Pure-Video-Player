@@ -15,18 +15,20 @@ const ORIGIN = 'https://huavod.net';
 const UA     = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) ' +
                'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
-// ── CORS helper ───────────────────────────────────────────────────────────────
-function addCors(headers) {
-  headers.set('Access-Control-Allow-Origin',   '*');
-  headers.set('Access-Control-Allow-Methods',  '*');
-  headers.set('Access-Control-Allow-Headers',  '*');
-  headers.set('Access-Control-Expose-Headers', '*');
-  return headers;
-}
+// ── CORS headers (returned on every response) ─────────────────────────────────
+const CORS = {
+  'Access-Control-Allow-Origin':   '*',
+  'Access-Control-Allow-Methods':  'GET, HEAD, OPTIONS',
+  'Access-Control-Allow-Headers':  '*',
+  'Access-Control-Expose-Headers': '*',
+  'Access-Control-Max-Age':        '86400',
+};
 
 function corsResponse(body, status, extraHeaders = {}) {
-  const h = addCors(new Headers(extraHeaders));
-  return new Response(body, { status, headers: h });
+  return new Response(body, {
+    status,
+    headers: { ...CORS, ...extraHeaders },
+  });
 }
 
 function jsonResp(obj, status = 200) {
@@ -62,7 +64,7 @@ function b64ToBytes(b64) {
   return out;
 }
 
-// ── Decrypt mac_player_info.url (mirrors main.js) ────────────────────────────
+// ── Decrypt mac_player_info.url ───────────────────────────────────────────────
 const M3U8_RE = /^https?:\/\/[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+\.m3u8/;
 
 function decrypt(raw, enc) {
@@ -85,7 +87,7 @@ function decrypt(raw, enc) {
       () => unescape(binary.split('').reverse().join('')),
       () => {
         const s = new TextDecoder('utf-8').decode(bytes);
-        const m = s.match(/^[a-zA-Z0-9._\-]+(\/[a-zA-Z0-9._\-]+)+\.m3u8/);
+        const m = s.match(/^[a-zA-Z0-9._\-]+\/[a-zA-Z0-9._\-/]+\.m3u8/);
         return m ? `https://p.okokserver.com/${m[0]}` : '';
       },
       () => {
@@ -147,7 +149,7 @@ async function extractStreamUrl(vodplayUrl) {
 
   // Hail-mary: scan raw HTML for any m3u8 URL
   if (!streamUrl) {
-    const rm = html.match(/(https?:\/\/[-A-Za-z0-9+&@#/%?=~_|!:,.;]+(\.m3u8))/i);
+    const rm = html.match(/(https?:\/\/[-A-Za-z0-9+&@#/%?=~_|!:,.;]+\.m3u8)/i);
     if (rm) {
       streamUrl = rm[1];
     } else {
@@ -168,8 +170,7 @@ async function extractStreamUrl(vodplayUrl) {
 }
 
 // ── M3U8 rewriter ─────────────────────────────────────────────────────────────
-// Segment referer is always ORIGIN — CDN validates the DOMAIN, not the m3u8 path.
-// Previously we used the m3u8 CDN URL as referer which caused 404 on every segment.
+// Segments always get ORIGIN as Referer — CDN validates domain, not m3u8 path.
 function rewriteM3u8(text, workerBase, m3u8Url) {
   return text.split('\n').map(line => {
     const l = line.trimEnd();
@@ -177,6 +178,22 @@ function rewriteM3u8(text, workerBase, m3u8Url) {
     const abs = l.startsWith('http') ? l : new URL(l, m3u8Url).href;
     return `${workerBase}/proxy?url=${encodeURIComponent(abs)}&ref=${encodeURIComponent(ORIGIN + '/')}`;
   }).join('\n');
+}
+
+// ── Detect correct Content-Type for a proxied URL ────────────────────────────
+function inferContentType(upstreamCt, targetUrl) {
+  // .ts segments — iOS Safari requires video/mp2t
+  if (/\.(ts)(\?|$)/i.test(targetUrl))  return 'video/mp2t';
+  // .m3u8
+  if (/\.m3u8(\?|$)/i.test(targetUrl))  return 'application/vnd.apple.mpegurl';
+  // .mp4 / .m4s / .fmp4
+  if (/\.(mp4|m4s|m4v|fmp4)(\?|$)/i.test(targetUrl)) return 'video/mp4';
+  // .aac
+  if (/\.aac(\?|$)/i.test(targetUrl))   return 'audio/aac';
+  // .mp3
+  if (/\.mp3(\?|$)/i.test(targetUrl))   return 'audio/mpeg';
+  // Fall back to whatever upstream said
+  return upstreamCt || 'application/octet-stream';
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -188,17 +205,20 @@ async function handle(req) {
 
   // ── CORS preflight ────────────────────────────────────────────────────────
   if (req.method === 'OPTIONS') {
-    return corsResponse('', 204);
+    return new Response(null, { status: 204, headers: CORS });
   }
 
   // ── HEAD /proxy — some HLS clients probe before GET ──────────────────────
   if (req.method === 'HEAD' && path === '/proxy') {
-    return corsResponse(null, 200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+    return new Response(null, {
+      status: 200,
+      headers: { ...CORS, 'Content-Type': 'application/vnd.apple.mpegurl' },
+    });
   }
 
   // ── /test — paste this URL in browser to verify deployment ───────────────
   if (path === '/test') {
-    return jsonResp({ ok: true, version: '2025-c', origin: ORIGIN });
+    return jsonResp({ ok: true, version: '2025-d', origin: ORIGIN });
   }
 
   // ── /extract ──────────────────────────────────────────────────────────────
@@ -215,8 +235,8 @@ async function handle(req) {
 
   // ── /proxy ────────────────────────────────────────────────────────────────
   if (path === '/proxy') {
-    // Support both ?ref= (new) and ?referer= (legacy) parameter names
     const target  = u.searchParams.get('url');
+    // Accept both ?ref= (rewritten segments) and ?referer= (initial m3u8 from renderer)
     const referer = u.searchParams.get('ref') || u.searchParams.get('referer') || ORIGIN + '/';
     if (!target) return jsonResp({ error: 'Missing url param' }, 400);
 
@@ -234,41 +254,61 @@ async function handle(req) {
       return jsonResp({ error: `fetch failed: ${err.message}`, target }, 502);
     }
 
-    const ct = upstream.headers.get('content-type') || '';
+    const upstreamCt = upstream.headers.get('content-type') || '';
 
-    // Return non-2xx as JSON diagnostic (visible in debug console)
+    // ── Upstream error: return diagnostic JSON with the upstream status code ─
+    // Client (renderer.js) can fetch() this URL first to read the error JSON
+    // and display "[Worker Error] Source status: 403" in the screen console.
     if (!upstream.ok) {
-      return jsonResp({ error: `Upstream ${upstream.status}`, target, referer }, upstream.status);
+      return jsonResp(
+        {
+          error:   `Upstream ${upstream.status}`,
+          target,
+          referer,
+          hint:    upstream.status === 403
+            ? 'CDN may be blocking Cloudflare IPs or requires specific Referer'
+            : upstream.status === 404
+            ? 'Segment/manifest not found on CDN'
+            : 'Upstream error',
+        },
+        upstream.status
+      );
     }
 
-    // Binary segments — stream directly without text conversion
-    const isBinary = ct.includes('video/') || ct.includes('audio/') ||
-                     ct.includes('octet-stream') ||
+    // ── Determine correct Content-Type ────────────────────────────────────
+    const ct = inferContentType(upstreamCt, target);
+
+    // ── Binary segments (TS / MP4 / audio) ───────────────────────────────
+    const isBinary = ct.startsWith('video/') || ct.startsWith('audio/') ||
+                     upstreamCt.includes('octet-stream') ||
                      /\.(ts|mp4|m4s|m4v|aac|mp3|fmp4)(\?|$)/i.test(target);
     if (isBinary) {
       const body = await upstream.arrayBuffer();
-      return corsResponse(body, upstream.status, {
-        'Content-Type':  ct || 'application/octet-stream',
-        'Cache-Control': 'public, max-age=3600',
+      return corsResponse(body, 200, {
+        'Content-Type':   ct,
+        'Content-Length': String(body.byteLength),
+        'Cache-Control':  'public, max-age=3600',
       });
     }
 
-    // Text — detect M3U8 by content-type, URL extension, or body prefix
+    // ── Text — check for M3U8 by content-type, URL, or body prefix ───────
     const text   = await upstream.text();
-    const isM3u8 = ct.includes('mpegurl') || ct.includes('x-mpegurl') ||
+    const isM3u8 = upstreamCt.includes('mpegurl') || upstreamCt.includes('x-mpegurl') ||
                    /\.m3u8(\?|$)/i.test(target) ||
                    text.trimStart().startsWith('#EXTM3U');
 
     if (isM3u8) {
       const workerBase = `${u.protocol}//${u.host}`;
       const rewritten  = rewriteM3u8(text, workerBase, target);
-      return corsResponse(rewritten, upstream.status, {
-        'Content-Type': 'application/vnd.apple.mpegurl',
+      return corsResponse(rewritten, 200, {
+        'Content-Type':  'application/vnd.apple.mpegurl',
+        'Cache-Control': 'no-cache',
       });
     }
 
-    return corsResponse(text, upstream.status, {
-      'Content-Type': ct || 'text/plain',
+    // ── Other text (pass through) ─────────────────────────────────────────
+    return corsResponse(text, 200, {
+      'Content-Type': upstreamCt || 'text/plain',
     });
   }
 
