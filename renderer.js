@@ -1,203 +1,5 @@
 'use strict';
 
-// ─── Environment detection ─────────────────────────────────────────────────────
-const isElectron = !!window.electronAPI;
-const isIOS = !isElectron && (
-  /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
-);
-
-// ── Cloudflare Worker base URL (only used in web / iPad mode) ─────────────────
-// Replace with your deployed worker URL before publishing the web build.
-const WORKER_URL = 'https://pure-video-proxy.yapshiuxian.workers.dev'.replace(/\/$/, '');
-
-// ─── Screen console (intercepts errors → visible on iPad, no F12 needed) ───
-if (!isElectron) {
-  const _dbgEl = document.getElementById('debug-log');
-  const _dbgLines = [];
-  function _dbgPush(msg, color) {
-    const t = new Date().toISOString().slice(11, 22);
-    _dbgLines.push(`<span style="color:#6b7280">[${t}]</span> <span style="color:${color}">${
-      String(msg).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    }</span>`);
-    if (_dbgLines.length > 30) _dbgLines.shift();
-    _dbgEl.innerHTML = _dbgLines.join('<br>');
-    _dbgEl.style.display = 'block';
-  }
-  const _ce = console.error.bind(console);
-  console.error = (...a) => { _ce(...a); _dbgPush(a.map(String).join(' '), '#f87171'); };
-  const _cw = console.warn.bind(console);
-  console.warn  = (...a) => { _cw(...a);  _dbgPush(a.map(String).join(' '), '#fbbf24'); };
-  const _cl = console.log.bind(console);
-  console.log   = (...a) => { _cl(...a);  _dbgPush(a.map(String).join(' '), '#86efac'); };
-  window.onerror = (msg, src, line) =>
-    _dbgPush(`ERR: ${msg} @ ${src}:${line}`, '#f87171');
-  window.onunhandledrejection = (e) =>
-    _dbgPush(`UNHANDLED: ${e.reason}`, '#fb923c');
-  // Startup diagnostic
-  console.log(`[Init] isIOS=${isIOS} worker=${WORKER_URL}`);
-}
-
-// ── Web polyfill: mirrors the electronAPI surface so the rest of the code
-//    needs zero changes when running in a browser (iPad / PWA). ───────────────
-if (!isElectron) {
-  // -- Helpers -----------------------------------------------------------------
-  async function fetchPage(sitePath) {
-    const res = await fetch(`${WORKER_URL}/api/page?path=${encodeURIComponent(sitePath)}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.text();
-  }
-
-  function parseCardsDOM(html) {
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-    const items = [];
-    doc.querySelectorAll('div.public-list-box, li.public-list-box').forEach(el => {
-      if (el.closest('.swiper-wrapper')) return;
-      const title = el.querySelector('a.time-title')?.textContent?.trim()
-        || el.querySelector('a.public-list-exp')?.getAttribute('title') || '';
-      const aEl = el.querySelector('a.public-list-exp');
-      const href = aEl?.getAttribute('href') || '';
-      const url = href.startsWith('http') ? href : 'https://huavod.net' + href;
-      const imgEl = el.querySelector('img');
-      const poster = imgEl?.dataset?.src || imgEl?.getAttribute('src') || '';
-      const badge = el.querySelector('span.public-prt')?.textContent?.trim() || '';
-      if (title && url.includes('/voddetail/')) items.push({ title, url, poster, badge });
-    });
-    return items;
-  }
-
-  function hasNextPageDOM(html) {
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-    if (doc.querySelector('a.page-next, a[title="下一页"]')) return true;
-    return doc.querySelectorAll('div.public-list-box:not(.swiper-wrapper *)').length >= 24;
-  }
-
-  // -- Web history (localStorage) ---------------------------------------------
-  const WEB_HISTORY_KEY = 'pvp_web_history';
-  function webGetHistory(vodID) {
-    const all = JSON.parse(localStorage.getItem(WEB_HISTORY_KEY) || '{}');
-    return Promise.resolve(all[vodID] || null);
-  }
-  function webSaveHistory(record) {
-    const all = JSON.parse(localStorage.getItem(WEB_HISTORY_KEY) || '{}');
-    all[record.vodID] = { episodeIndex: record.episodeIndex, currentTime: record.currentTime, updatedAt: Date.now() };
-    localStorage.setItem(WEB_HISTORY_KEY, JSON.stringify(all));
-  }
-
-  // -- Sniff event bridge: simulates IPC events with CustomEventTarget --------
-  // Use `let` so removeAllListeners() can replace the bus entirely.
-  // Closures reference the variable, so reassignment orphans old listeners.
-  let sniffBus = new EventTarget();
-  let _sniffController = null;
-
-  // -- electronAPI polyfill ----------------------------------------------------
-  window.electronAPI = {
-    // Catalog
-    scrapeCategory: async (catId, page, area, year) => {
-      let path = `/vodshow/${catId}`;
-      if (area && area !== '全部') path += `/area/${encodeURIComponent(area)}`;
-      if (year && year !== '全部') path += `/year/${year}`;
-      path += page > 1 ? `/${page}.html` : '.html';
-      const html = await fetchPage(path);
-      return { items: parseCardsDOM(html), hasMore: hasNextPageDOM(html) };
-    },
-    scrapeSearch: async (keyword, page) => {
-      const res = await fetch(`${WORKER_URL}/api/search?q=${encodeURIComponent(keyword)}&page=${page || 1}`);
-      return res.json();
-    },
-    getDetail: async (url) => {
-      const html = await fetchPage(url.replace('https://huavod.net', ''));
-      const doc = new DOMParser().parseFromString(html, 'text/html');
-      const sources = [];
-      const tabEls = doc.querySelectorAll('.anthology-tab .swiper-wrapper a.swiper-slide');
-      const listBoxes = doc.querySelectorAll('.anthology-list .anthology-list-box');
-      if (tabEls.length) {
-        tabEls.forEach((tabEl, i) => {
-          const name = tabEl.cloneNode(true);
-          name.querySelectorAll('i').forEach(n => n.remove());
-          const episodes = [];
-          listBoxes[i]?.querySelectorAll('a[href*="/vodplay/"]').forEach(a => {
-            const href = a.getAttribute('href');
-            episodes.push({ title: a.textContent.trim(), url: href.startsWith('http') ? href : 'https://huavod.net' + href });
-          });
-          if (episodes.length) sources.push({ name: name.textContent.trim() || `线路${i + 1}`, episodes });
-        });
-      }
-      if (!sources.length) {
-        const episodes = [];
-        const seen = new Set();
-        doc.querySelectorAll('a[href*="/vodplay/"]').forEach(a => {
-          const href = a.getAttribute('href');
-          const url = href.startsWith('http') ? href : 'https://huavod.net' + href;
-          if (!seen.has(url) && a.textContent.trim().length < 30) { seen.add(url); episodes.push({ title: a.textContent.trim(), url }); }
-        });
-        if (episodes.length) sources.push({ name: '默认线路', episodes });
-      }
-      return { sources };
-    },
-    fetchFilterOptions: async (catId) => {
-      const html = await fetchPage(`/vodshow/${catId}.html`);
-      const doc = new DOMParser().parseFromString(html, 'text/html');
-      const areas = [], years = [], sa = new Set(), sy = new Set();
-      doc.querySelectorAll('a[href*="/area/"]').forEach(a => {
-        const m = (a.getAttribute('href') || '').match(/\/area\/([^./]+)/);
-        if (!m) return;
-        let v; try { v = decodeURIComponent(m[1]); } catch { v = m[1]; }
-        if (v && !sa.has(v)) { sa.add(v); areas.push(v); }
-      });
-      doc.querySelectorAll('a[href*="/year/"]').forEach(a => {
-        const m = (a.getAttribute('href') || '').match(/\/year\/(\d{4})/);
-        if (m && !sy.has(m[1])) { sy.add(m[1]); years.push(m[1]); }
-      });
-      return { areas, years: years.sort((a, b) => Number(b) - Number(a)) };
-    },
-    // History
-    getHistory: webGetHistory,
-    saveHistory: webSaveHistory,
-    // Sniffer (event-bridge pattern — triggerSniff code stays unchanged)
-    stopSniff: () => { _sniffController?.abort(); },
-    removeAllListeners: () => {
-      sniffBus = new EventTarget(); // replace — old listeners are orphaned & GC'd
-    },
-    onM3u8Found:    (cb) => sniffBus.addEventListener('m3u8-found', e => cb(e.detail), { once: true }),
-    onSniffError:   (cb) => sniffBus.addEventListener('sniff-error', e => cb(e.detail), { once: true }),
-    onStatusUpdate: (cb) => sniffBus.addEventListener('status',     e => cb(e.detail), { once: true }),
-    sniffUrl: async (vodUrl) => {
-      _sniffController = new AbortController();
-      sniffBus.dispatchEvent(new CustomEvent('status', { detail: '⏳ 正在提取播放源…' }));
-      try {
-        const res  = await fetch(`${WORKER_URL}/extract?url=${encodeURIComponent(vodUrl)}`, { signal: _sniffController.signal });
-        const data = await res.json();
-        if (data.error) {
-          // Worker failed — if it returned a candidateUrl, try direct iPad play
-          // (iPad's real IP bypasses Cloudflare IP blocking on the CDN).
-          if (data.candidateUrl && isIOS) {
-            console.warn('[Fallback] Worker 404/403 — trying direct iPad play:', data.candidateUrl);
-            sniffBus.dispatchEvent(new CustomEvent('status', { detail: '⚡ 切换直连模式…' }));
-            sniffBus.dispatchEvent(new CustomEvent('m3u8-found', {
-              detail: { streamUrl: data.candidateUrl, direct: true },
-            }));
-            return;
-          }
-          throw new Error(data.error);
-        }
-        sniffBus.dispatchEvent(new CustomEvent('m3u8-found', { detail: { streamUrl: data.streamUrl } }));
-      } catch (err) {
-        if (err.name !== 'AbortError') {
-          sniffBus.dispatchEvent(new CustomEvent('sniff-error', { detail: err.message }));
-        }
-      }
-    },
-    // Window controls — no-op on web
-    minimize: () => { }, maximize: () => { }, close: () => { },
-    // Auto-updater — no-op on web
-    onUpdateAvailable: () => { }, onUpdateProgress: () => { },
-    onUpdateDownloaded: () => { }, onUpdateError: () => { },
-    restartApp: () => { },
-  };
-}
-
-
 const catalogView = document.getElementById('catalog-view');
 const playerView = document.getElementById('player-view');
 const cardGrid = document.getElementById('card-grid');
@@ -747,6 +549,7 @@ function _renderEpBtns(episodes, activeIndex = 0) {
     const btn = document.createElement('button');
     btn.className = 'ep-btn';
     btn.textContent = ep.title;
+    btn.dataset.url = ep.url;
 
     if (originalIdx === activeIndex) {
       btn.classList.add('active');
@@ -984,10 +787,8 @@ backBtn.addEventListener('click', () => {
 
 // ─── Player Sniff Logic ───────────────────────────────────────────────────────
 let dpInstance = null;
-let isSniffing   = false;
-let isIosLoading = false; // prevents duplicate src assignment on iOS
-let iosLoadTs    = 0;     // timestamp of last iOS load attempt (ms)
-let globalErrorToastTimer = null; // 全局计时器，防止旧的播放器实例触发的错误残留
+let isSniffing       = false;
+let globalErrorToastTimer = null;
 
 function setPlayerStatus(msg, type = 'info') {
   spinner.style.display = type === 'loading' ? 'block' : 'none';
@@ -1002,9 +803,7 @@ function setPlayerLoading(on) {
   playerUrlInput.disabled = on;
 }
 
-function launchPlayer(streamUrl, skipProxy = false) {
-  isIosLoading = false; // reset lock — new episode cancels any in-flight iOS preflight
-  iosLoadTs    = 0;
+function launchPlayer(streamUrl) {
   if (dpInstance) {
     try { dpInstance.pause(); } catch (_) { }
     try { if (dpInstance.video) dpInstance.video.muted = true; } catch (_) { }
@@ -1016,24 +815,8 @@ function launchPlayer(streamUrl, skipProxy = false) {
   if (_artEl) _artEl.innerHTML = '';
   playerPlaceholder.classList.add('hidden');
 
-  // Direct mode: use raw CDN URL (iPad's real IP, bypasses Cloudflare IP blocking).
-  // Proxy mode:  route through Worker so CORS + Referer headers are injected.
-  const playUrl = (isElectron || skipProxy)
-    ? streamUrl
-    : `${WORKER_URL}/proxy?url=${encodeURIComponent(streamUrl)}&referer=${encodeURIComponent('https://huavod.net/')}`;
-
-  // Debug overlay — shows while a segment is actively loading (web mode only).
-  let debugEl = null;
-  if (!isElectron) {
-    debugEl = document.createElement('div');
-    debugEl.style.cssText = 'position:absolute;bottom:52px;left:8px;color:#fff;font-size:11px;' +
-      'background:rgba(0,0,0,.65);padding:2px 8px;border-radius:3px;z-index:9999;pointer-events:none;display:none';
-    debugEl.textContent = '[Debug] Loading segment...';
-    document.getElementById('artplayer').appendChild(debugEl);
-  }
-
-  let bitrateInfoEl = null;      // 闭包变量，ready 后赋值，FRAG_LOADED 直接引用
-  let pendingRestoreMsg = '';    // MANIFEST_PARSED 里设置，play 事件里显示
+  let bitrateInfoEl   = null;
+  let pendingRestoreMsg = '';
 
   const activeSourceBtn = document.querySelector('#source-tab-bar .source-tab.active');
   const sourceName = activeSourceBtn ? activeSourceBtn.textContent : '';
@@ -1047,12 +830,12 @@ function launchPlayer(streamUrl, skipProxy = false) {
 
   dpInstance = new Artplayer({
     container: document.getElementById('artplayer'),
-    url: playUrl,
+    url: streamUrl,
     type: 'm3u8',
     theme: '#7c3aed',
-    autoplay: !isIOS,        // iOS: autoplay blocked by browser policy — user taps to start
-    muted: !isElectron,      // Web/iOS: start muted so any autoplay attempt is allowed
-    playsinline: true,       // Prevent iOS fullscreen hijack
+    autoplay: true,
+    muted: false,
+    playsinline: true,
     autoSize: true,
     fullscreen: true,
     fullscreenWeb: true,
@@ -1090,76 +873,13 @@ function launchPlayer(streamUrl, skipProxy = false) {
     ],
     customType: {
       m3u8: function (video, url, art) {
-        if (isIOS) {
-          // iOS: bypass HLS.js entirely — Safari handles HLS natively.
-          // autoplay is OFF; user must tap the centre ▶ button.
-
-          // Lock: suppress duplicate loads within 1 second, and suppress any
-          // stale IIFE that survived an episode switch.
-          const now = Date.now();
-          if (isIosLoading && (now - iosLoadTs) < 1000) {
-            console.log('[iOS] duplicate load suppressed (' + (now - iosLoadTs) + 'ms since last)');
-            return;
-          }
-          isIosLoading = true;
-          iosLoadTs    = now;
-
-          // Ensure correct attributes on the native <video> element
-          video.setAttribute('playsinline',        '');
-          video.setAttribute('webkit-playsinline', '');
-          video.setAttribute('preload',            'auto');
-
-          const proxyUrl = url;
-          if (debugEl) { debugEl.style.display = 'block'; debugEl.textContent = '[Debug] iOS preflight check…'; }
-
-          (async () => {
-            // Skip preflight in direct mode — raw CDN URLs don't have CORS headers
-            // so a JS fetch() would fail. Safari's <video> doesn't enforce CORS.
-            const isDirect = !url.includes(WORKER_URL);
-            if (!isDirect) {
-              try {
-                const check = await fetch(proxyUrl);
-                if (!check.ok) {
-                  const body = await check.text().catch(() => '');
-                  console.error(`[Worker Error] Source status: ${check.status} — ${body.slice(0, 300)}`);
-                  if (debugEl) { debugEl.style.display = 'block'; debugEl.textContent = `[Debug] Worker status ${check.status}`; }
-                  isIosLoading = false;
-                  return;
-                }
-                const ct = check.headers.get('content-type') || '';
-                console.log(`[iOS] preflight OK ct=${ct}`);
-                if (!ct.includes('mpegurl') && !ct.includes('m3u8')) {
-                  console.warn(`[iOS] unexpected m3u8 content-type: ${ct}`);
-                }
-              } catch (e) {
-                console.error('[iOS] preflight fetch error:', e.message);
-                isIosLoading = false;
-                return;
-              }
-            } else {
-              console.log('[iOS] direct mode — skipping CORS preflight');
-            }
-
-            console.log('[iOS] assigning proxy src =', proxyUrl);
-            if (debugEl) debugEl.textContent = '[Debug] iOS native HLS ready — tap ▶ to play';
-            video.src = proxyUrl;
-            video.load();
-            // NO video.play() — calling play() without a user gesture causes AbortError.
-            console.log('[System] 视频已就绪，请点击屏幕中间开始播放');
-
-            video.addEventListener('canplay', () => {
-              console.log('[iOS] canplay — buffer ready, waiting for tap');
-              if (debugEl) debugEl.style.display = 'none';
-              isIosLoading = false;
-            }, { once: true });
-            video.addEventListener('error', () => {
-              const e = video.error;
-              console.error('[iOS] video error code=' + (e && e.code) + ' msg=' + (e && e.message));
-              if (debugEl) { debugEl.style.display = 'block'; debugEl.textContent = '[Debug] video.error code=' + (e && e.code); }
-              isIosLoading = false;
-            }, { once: true });
-          })();
-        } else if (Hls.isSupported()) {
+        // Destroy any previous HLS instance — this fires on both first load
+        // and every subsequent switchUrl() call.
+        if (art.hls) {
+          try { art.hls.destroy(); } catch (_) {}
+          art.hls = null;
+        }
+        if (Hls.isSupported()) {
           const hls = new Hls({
             enableWorker: true,
             fragLoadingMaxRetry: 10,
@@ -1176,10 +896,9 @@ function launchPlayer(streamUrl, skipProxy = false) {
           art.hls = hls;
           art.on('destroy', () => hls.destroy());
 
-          hls.on(Hls.Events.FRAG_LOADING, () => { if (debugEl) debugEl.style.display = 'block'; });
+          hls.on(Hls.Events.FRAG_LOADING, () => {});
 
           hls.on(Hls.Events.FRAG_LOADED, (_e, data) => {
-            if (debugEl) debugEl.style.display = 'none';
             try {
               // 跳过 init segment（sn 为 'initSegment'，没有有效 duration）
               if (!data.frag || data.frag.sn === 'initSegment') return;
@@ -1204,10 +923,16 @@ function launchPlayer(streamUrl, skipProxy = false) {
             // 清单加载完毕后恢复播放位置（延迟一帧让 ArtPlayer 完成初始化再 seek）
             if (lastWatchedTime > 3 && !hasRestoredTime) {
               hasRestoredTime = true;
-              const mm = Math.floor(lastWatchedTime / 60).toString().padStart(2, '0');
-              const ss = Math.floor(lastWatchedTime % 60).toString().padStart(2, '0');
-              pendingRestoreMsg = `已为您恢复到上次观看位置：${mm}:${ss}`;
-              setTimeout(() => { video.currentTime = lastWatchedTime; }, 200);
+              opSkipped = true; // 阻止 video:canplay 重复处理
+              const { op } = getSkipForVod(currentVodID);
+              // 若上次观看位置仍在片头内，则直接从跳过点恢复，避免重看片头
+              const seekTo = (op > 0 && lastWatchedTime < op) ? op : lastWatchedTime;
+              const mm = Math.floor(seekTo / 60).toString().padStart(2, '0');
+              const ss = Math.floor(seekTo % 60).toString().padStart(2, '0');
+              pendingRestoreMsg = seekTo === lastWatchedTime
+                ? `已为您恢复到上次观看位置：${mm}:${ss}`
+                : `已跳过片头，从 ${mm}:${ss} 继续`;
+              setTimeout(() => { video.currentTime = seekTo; }, 200);
             }
 
             const levels = data.levels || [];
@@ -1321,26 +1046,27 @@ function launchPlayer(streamUrl, skipProxy = false) {
     }
   });
 
-  // 片头 & 片尾 skip — 统一在 timeupdate 处理（video 确实在播才触发，seek 可靠）
-  dpInstance.on('video:timeupdate', () => {
-    const ct = dpInstance.currentTime;
-    const dur = dpInstance.duration;
-
-    // 片头：首次 ct > 0，且 restore 已完成（或本集无历史记录）
-    if (!opSkipped && ct > 0 && (!lastWatchedTime || hasRestoredTime)) {
+  // 片头跳过 — 在 video:canplay 统一处理，确保自动跳集时也能可靠跳过
+  // （timeupdate 方案存在竞态：旧视频的 timeupdate 在 opSkipped 重置后仍会触发，误将其重新设为 true）
+  dpInstance.on('video:canplay', () => {
+    if (opSkipped) return;
+    const { op } = getSkipForVod(currentVodID);
+    if (op <= 0) return;
+    // 当前时间小于跳过点时才执行，排除已有观看记录且记录在跳过点之后的情况（由 MANIFEST_PARSED 处理）
+    if (dpInstance.currentTime < op) {
       opSkipped = true;
-      const { op } = getSkipForVod(currentVodID);
-      // 只有上次观看位置也在片头以内时才跳过，否则说明用户已看过片头
-      if (op > 0 && ct < op && lastWatchedTime < op) {
-        dpInstance.currentTime = op;
-        showToast(`已跳过片头 ${op} 秒`, 'success');
-      }
+      dpInstance.currentTime = op;
+      showToast(`已跳过片头 ${op} 秒`, 'success');
     }
+  });
 
-    // 片尾：剩余时长 <= ed 时触发下一集倒计时
-    if (!edSkipTriggered && dur > 0) {
+  // 片尾 skip — timeupdate 监听
+  dpInstance.on('video:timeupdate', () => {
+    if (edSkipTriggered) return;
+    const dur = dpInstance.duration;
+    if (dur > 0) {
       const { ed } = getSkipForVod(currentVodID);
-      if (ed > 0 && ct >= dur - ed) {
+      if (ed > 0 && dpInstance.currentTime >= dur - ed) {
         edSkipTriggered = true;
         if (hasNextEpisode()) showNextCountdownToast();
       }
@@ -1365,45 +1091,61 @@ function triggerSniff(url, sourceName = '') {
   isSniffing = true;
   opSkipped = false;
   edSkipTriggered = false;
-  sniffFallbackCount = 0;   // always reset so each fresh triggerSniff gets one retry
+  sniffFallbackCount = 0;
   hideAllToasts();
 
-  // 提前销毁现有的播放器，防止后台继续播放或报错
+  // Mute but keep the player alive — switchUrl() will load the new stream
+  // without destroying fullscreen state.
   if (dpInstance) {
-    try { dpInstance.pause(); } catch (_) { }
-    try { if (dpInstance.video) dpInstance.video.muted = true; } catch (_) { }
-    try { if (dpInstance.hls) { dpInstance.hls.destroy(); dpInstance.hls = null; } } catch (_) { }
-    try { dpInstance.destroy(); } catch (_) { }
-    dpInstance = null;
-    document.getElementById('artplayer').innerHTML = '';
+    try { dpInstance.pause(); } catch (_) {}
+    try { if (dpInstance.video) dpInstance.video.muted = true; } catch (_) {}
   }
 
-  // Abort any in-progress sniff before starting a fresh one
   window.electronAPI.stopSniff();
-
   window.electronAPI.removeAllListeners();
 
   window.electronAPI.onStatusUpdate(msg => {
     if (state.view === 'player') setPlayerStatus(msg, 'loading');
   });
-  window.electronAPI.onM3u8Found(({ streamUrl, direct }) => {
-    if (state.view !== 'player') return; // Guard against rogue ghost sniff returns!
+  window.electronAPI.onM3u8Found(({ streamUrl }) => {
+    if (state.view !== 'player') return;
     isSniffing = false;
     setPlayerLoading(false);
-    setPlayerStatus(direct ? '⚡ 直连模式' : '✅ 正在播放', 'success');
-    launchPlayer(streamUrl, direct || false);
+    setPlayerStatus('✅ 正在播放', 'success');
+    if (dpInstance) {
+      try { dpInstance.video.muted = false; } catch (_) {}
+      dpInstance.switchUrl(streamUrl);
+    } else {
+      launchPlayer(streamUrl);
+    }
     setTimeout(clearPlayerStatus, 3000);
+
+    // 3秒后开始静默预嗅探下一集（等当前集缓冲稳定后再抢跑，避免网络竞争）
+    setTimeout(() => {
+      if (state.view !== 'player') return;
+      const activeBtn = epGrid.querySelector('.ep-btn.active');
+      const nextBtn = epSortDesc
+        ? activeBtn?.previousElementSibling
+        : activeBtn?.nextElementSibling;
+      if (nextBtn?.classList.contains('ep-btn') && nextBtn.dataset.url) {
+        window.electronAPI.preloadNext(nextBtn.dataset.url);
+      }
+    }, 3000);
   });
   window.electronAPI.onSniffError(msg => {
     if (state.view !== 'player') return;
     setPlayerLoading(false);
     setPlayerStatus(msg, 'error');
     showToast(msg, 'error');
-    playerPlaceholder.classList.remove('hidden');
+    if (dpInstance) {
+      try { dpInstance.video.muted = false; } catch (_) {}
+    } else {
+      playerPlaceholder.classList.remove('hidden');
+    }
   });
 
   setPlayerLoading(true);
-  setPlayerStatus('🚀 启动嚅探器…', 'loading');
+  setPlayerStatus('🚀 启动嗅探器…', 'loading');
   window.electronAPI.sniffUrl(url, sourceName);
 }
 
@@ -1452,36 +1194,20 @@ function showNextCountdownToast() {
   const toast = document.createElement('div');
   toast.id = 'next-countdown-toast';
 
-  let left = 3;
   toast.innerHTML = `
-    <span><b>${left}</b> 秒后自动播放下一集</span>
+    <span>正在播放下一集…</span>
     <button id="cancel-next-btn">取消</button>
-    <button id="play-next-now-btn">立即播放</button>
   `;
 
   container.appendChild(toast);
-  const numSpan = toast.querySelector('b');
 
   toast.querySelector('#cancel-next-btn').onclick = (e) => {
     e.stopPropagation();
     hideNextCountdownToast();
   };
 
-  toast.querySelector('#play-next-now-btn').onclick = (e) => {
-    e.stopPropagation();
-    hideNextCountdownToast();
-    playNextEpisode();
-  };
-
-  nextCountdownTimer = setInterval(() => {
-    left--;
-    if (left <= 0) {
-      hideNextCountdownToast();
-      playNextEpisode();
-    } else {
-      numSpan.textContent = left;
-    }
-  }, 1000);
+  // 立即播放，无需倒计时
+  playNextEpisode();
 }
 
 function hideNextCountdownToast() {

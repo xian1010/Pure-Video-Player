@@ -4,6 +4,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('electronAPI', {
   // ── Sniffer ───────────────────────────────────────────────────────────────
   sniffUrl:          (url, sourceName) => ipcRenderer.send('ipc:sniff-url', url, sourceName),
+  preloadNext:       (url)            => ipcRenderer.send('ipc:preload-next', url),
   onM3u8Found:       (cb)       => ipcRenderer.on('ipc:m3u8-found',    (_e, d) => cb(d)),
   onSniffError:      (cb)       => ipcRenderer.on('ipc:sniff-error',   (_e, m) => cb(m)),
   onStatusUpdate:    (cb)       => ipcRenderer.on('ipc:status',        (_e, m) => cb(m)),

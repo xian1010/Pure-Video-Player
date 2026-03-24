@@ -1,6 +1,6 @@
 {
   "name": "pure-video-player",
-  "version": "2.1.8",
+  "version": "2.1.10",
   "description": "An Electron-based ad-free video player with catalog browsing and m3u8 stream sniffing",
   "main": "main.js",
   "scripts": {

@@ -351,11 +351,7 @@ function registerImageProxy() {
         headers: { 'Content-Type': resp.headers['content-type'] || 'image/jpeg' }
       });
     } catch (e) {
-      // If the proxy fails, just gracefully redirect the browser to fetch the raw image directly
-      return new Response(null, {
-        status: 302,
-        headers: { 'Location': realUrl }
-      });
+      return Response.redirect(realUrl, 302);
     }
   });
 }
@@ -374,6 +370,93 @@ function cleanupSniffer() {
   capturedM3u8    = null;
   capturedHeaders = {};
   sniffAborted    = false;
+}
+
+// ─── Preload Cache (background sniff of next episode) ─────────────────────────
+const preloadCache = new Map(); // vodplayUrl → m3u8Url | 'pending'
+let preloadWin = null;
+let preloadSessionObj = null; // Dedicated session so its onBeforeRequest never clashes with defaultSession
+
+function stopPreload() {
+  if (preloadWin && !preloadWin.isDestroyed()) {
+    try { preloadWin.destroy(); } catch (_) {}
+    preloadWin = null;
+  }
+  if (preloadSessionObj) {
+    try { preloadSessionObj.webRequest.onBeforeRequest(null, null); } catch (_) {}
+  }
+}
+
+function initPreloadSession() {
+  if (preloadSessionObj) return;
+  preloadSessionObj = session.fromPartition('preload', { cache: false });
+  // Spoof headers for the preload session, same as permanent spoofer on defaultSession
+  preloadSessionObj.webRequest.onBeforeSendHeaders({ urls: ['<all_urls>'] }, (details, cb) => {
+    const headers = { ...details.requestHeaders };
+    headers['Referer']    = 'https://huavod.net/';
+    headers['Origin']     = 'https://huavod.net';
+    headers['User-Agent'] = CHROME_UA;
+    cb({ requestHeaders: headers });
+  });
+}
+
+function startPreload(vodplayUrl) {
+  if (preloadCache.has(vodplayUrl)) return; // Already cached or in-progress
+  if (snifferWin) return;                   // Main sniffer is active, skip
+  preloadCache.set(vodplayUrl, 'pending');
+  stopPreload();
+  initPreloadSession();
+
+  let finalUrl = vodplayUrl;
+  if (vodplayUrl.includes('/voddetail/')) {
+    finalUrl = vodplayUrl.replace('/voddetail/', '/vodplay/').replace('.html', '-1-1.html');
+  }
+  if (!finalUrl.startsWith('http')) finalUrl = BASE_URL + finalUrl;
+  console.log('[Preload] 🔄 Starting background preload:', finalUrl);
+
+  preloadWin = new BrowserWindow({
+    show: false, skipTaskbar: true, focusable: false,
+    backgroundThrottling: true,
+    webPreferences: {
+      session: preloadSessionObj,
+      nodeIntegration: false,
+      contextIsolation: false,
+      webSecurity: false,
+      nodeIntegrationInSubFrames: true,
+      preload: path.join(__dirname, 'preload_sniffer.js'),
+      devTools: false,
+      javascript: true,
+      autoplayPolicy: 'user-gesture-required',
+    },
+  });
+  preloadWin.webContents.setAudioMuted(true);
+
+  preloadSessionObj.webRequest.onBeforeRequest({ urls: ['<all_urls>'] }, (details, callback) => {
+    const url = details.url;
+    const blockTypes = ['image', 'stylesheet', 'font', 'media', 'ping'];
+    if (blockTypes.includes(details.resourceType)) { callback({ cancel: true }); return; }
+    if (url.includes('okokserver.com') && url.includes('.mp4')) { callback({ cancel: true }); return; }
+
+    const isM3u8 = url.toLowerCase().includes('.m3u8') && !url.includes('api.php');
+    if (isM3u8 && !(isAdUrl(url) && !url.includes('okokserver'))) {
+      if (preloadCache.get(vodplayUrl) === 'pending') {
+        preloadCache.set(vodplayUrl, url);
+        console.log('[Preload] ✅ Cached m3u8 for next episode:', url);
+        try { preloadSessionObj.webRequest.onBeforeRequest(null, null); } catch (_) {}
+        if (preloadWin && !preloadWin.isDestroyed()) { preloadWin.destroy(); preloadWin = null; }
+      }
+    }
+    callback({});
+  });
+
+  // Give up after 25s to avoid orphaned windows
+  setTimeout(() => {
+    if (preloadCache.get(vodplayUrl) === 'pending') preloadCache.delete(vodplayUrl);
+    if (preloadWin && !preloadWin.isDestroyed()) { preloadWin.destroy(); preloadWin = null; }
+    try { preloadSessionObj.webRequest.onBeforeRequest(null, null); } catch (_) {}
+  }, 25000);
+
+  preloadWin.loadURL(finalUrl, { userAgent: CHROME_UA }).catch(() => {});
 }
 
 // Permanent Referer/Origin spoofer — registered once at startup, covers ALL URLs.
@@ -427,10 +510,24 @@ async function startSniffing(targetUrl, sourceName = '') {
 
   sendStatus('🚀 并行启动深度嗅探引擎与快速提取…');
 
+  // ── Check preload cache (next-episode pre-sniff) ──
+  stopPreload(); // Always stop preload window before starting main sniff (avoids session.onBeforeRequest conflict)
+  const preloadHit = preloadCache.get(finalUrl);
+  if (preloadHit && preloadHit !== 'pending') {
+    preloadCache.delete(finalUrl);
+    console.log('[Preload] 🎯 Cache hit — instant playback:', preloadHit);
+    sendStatus('⚡ 下一集已就绪，立即播放…');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('ipc:m3u8-found', { streamUrl: preloadHit, referer: BASE_URL + '/', userAgent: CHROME_UA });
+    }
+    return;
+  }
+  preloadCache.delete(finalUrl); // Drop any stale 'pending' marker for this URL
+
   // 1. 立即启动后台深度嗅探窗口 (Parallel Background Sniffer)
   snifferWin = new BrowserWindow({
     width: 800, height: 600,
-    show: false, skipTaskbar: true,
+    show: false, skipTaskbar: true, focusable: false,
     backgroundThrottling: false,
     webPreferences: {
       nodeIntegration: false,
@@ -479,33 +576,19 @@ async function startSniffing(targetUrl, sourceName = '') {
           return;
         }
 
-        const candidateUrl = url;
-        const candidateReferer = details.referrer || BASE_URL + '/';
-
-        console.log(`[Sniffer] ⏳ Verifying intercepted M3U8 at ${elapsed}s:`, candidateUrl);
-
-        axios.head(candidateUrl, {
-          timeout: 4000, maxRedirects: 4,
-          headers: { 'Referer': 'https://huavod.net/', 'User-Agent': CHROME_UA },
-          httpsAgent: new https.Agent({ rejectUnauthorized: false })
-        }).then(res => {
-          if (res.status >= 200 && res.status < 400 && !capturedM3u8) {
-            capturedM3u8 = candidateUrl;
-            console.log(`[Sniffer] 🔥 Interception verified 200 OK! Sending to renderer:`, candidateUrl);
-            sendStatus('✅ Stream verified! Launching player…');
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('ipc:m3u8-found', {
-                streamUrl: candidateUrl,
-                referer: candidateReferer,
-                userAgent: CHROME_UA,
-              });
-            }
-            if (snifferWin && !snifferWin.isDestroyed()) { snifferWin.destroy(); snifferWin = null; }
-            setImmediate(() => cleanupSniffer());
-          }
-        }).catch(err => {
-          console.log(`[Sniffer] 🚫 Intercepted M3U8 verification failed (404/dead): ${err.message}`);
-        });
+        capturedM3u8 = url;
+        const referer = details.referrer || BASE_URL + '/';
+        console.log(`[Sniffer] ⚡ Intercepted M3U8 at ${elapsed}s — sending immediately:`, url);
+        sendStatus('✅ Stream captured! Launching player…');
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('ipc:m3u8-found', {
+            streamUrl: url,
+            referer,
+            userAgent: CHROME_UA,
+          });
+        }
+        if (snifferWin && !snifferWin.isDestroyed()) { snifferWin.destroy(); snifferWin = null; }
+        setImmediate(() => cleanupSniffer());
 
         callback({});
         return;
@@ -545,7 +628,7 @@ async function startSniffing(targetUrl, sourceName = '') {
     cleanupSniffer();
   });
 
-  // 2. 并行执行快速验证 (Fast Extraction with 800ms HEAD)
+  // 2. 并行快速提取 (Fast Extraction — 无 HEAD 验证，直接信任解出的 URL)
   const is4K = (sourceName || '').toUpperCase().includes('4K');
   if (finalUrl.includes('/vodplay/') && !is4K) {
     try {
@@ -640,30 +723,15 @@ async function startSniffing(targetUrl, sourceName = '') {
         candidateUrl = hailMaryUrl;
       }
 
-      // 极速验证 HEAD 且超时设定极短 (800ms)
+      // 直接信任通过正则验证的 URL，不做 HEAD 验证（HEAD 会耗时 800ms~4s）
       if (candidateUrl && !capturedM3u8) {
-        console.log(`[Sniffer] ⚡ Extracted candidate: ${candidateUrl}, doing 800ms HEAD check...`);
-        try {
-          const headRes = await axios.head(candidateUrl, {
-            timeout: 800,
-            headers: { 'Referer': 'https://huavod.net/', 'User-Agent': CHROME_UA },
-            maxRedirects: 4,
-            httpsAgent: new https.Agent({ rejectUnauthorized: false }),
-          });
-          
-          if (headRes.status >= 200 && headRes.status < 400 && !capturedM3u8) {
-            console.log(`[Sniffer] ⚡ Fast extraction HEAD SUCCESS ${headRes.status}: ${candidateUrl}`);
-            capturedM3u8 = candidateUrl; // 锁定后台嗅探，防止它再发
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('ipc:m3u8-found', { streamUrl: candidateUrl, referer: BASE_URL+'/', userAgent: CHROME_UA });
-            }
-            cleanupSniffer();
-          } else {
-            console.log(`[Sniffer] ⚡ Fast extraction HEAD bad status ${headRes.status} - leaving to background sniffer`);
-          }
-        } catch (e) {
-          console.log(`[Sniffer] ⚡ Fast extraction HEAD failed or timed out (${e.message}) - background sniffer is already analyzing!`);
+        capturedM3u8 = candidateUrl;
+        console.log(`[Sniffer] ⚡ Fast extraction sending immediately: ${candidateUrl}`);
+        sendStatus('✅ Stream extracted! Launching player…');
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('ipc:m3u8-found', { streamUrl: candidateUrl, referer: BASE_URL+'/', userAgent: CHROME_UA });
         }
+        cleanupSniffer();
       }
 
     } catch (e) {
@@ -693,11 +761,17 @@ ipcMain.on('ipc:sniff-url', (_event, url, sourceName) => {
 });
 
 ipcMain.on('ipc:stop-sniff', () => {
+  stopPreload();
   cleanupSniffer();
 });
 
 ipcMain.on('stop-sniffing', () => {
+  stopPreload();
   cleanupSniffer();
+});
+
+ipcMain.on('ipc:preload-next', (_event, url) => {
+  if (url && typeof url === 'string') startPreload(url);
 });
 
 // Catalog: fetch a category page
@@ -902,6 +976,7 @@ function setupAutoUpdater() {
 app.whenReady().then(async () => {
   registerPermanentRefererSpoofer();
   registerImageProxy();
+  initPreloadSession(); // Initialise preload session early so it's ready when needed
   createMainWindow();
 
   // Load remote site-parsing logic; built-in logic is used until it resolves
