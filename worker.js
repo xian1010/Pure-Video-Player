@@ -242,21 +242,36 @@ async function handle(request) {
     if (!target) return json({ error: 'Missing url param' }, 400);
     try {
       const upstream = await fetch(target, {
-        headers: { 'User-Agent': UA, 'Referer': referer },
+        headers: {
+          'User-Agent': UA,
+          'Referer':    referer,
+          'Origin':     ORIGIN,
+        },
       });
       const ct = upstream.headers.get('content-type') || '';
-      const body = await upstream.text();
+      const isM3u8 = ct.includes('mpegurl') || target.includes('.m3u8');
 
-      let responseBody = body;
-      if (ct.includes('mpegurl') || target.includes('.m3u8')) {
+      if (isM3u8) {
+        // Text playlist — rewrite all segment/sub-playlist URLs through /proxy
+        const text = await upstream.text();
         const workerBase = `${u.protocol}//${u.host}`;
-        responseBody = rewriteM3u8(body, workerBase, target);
+        const rewritten  = rewriteM3u8(text, workerBase, target);
+        return cors(rewritten, {
+          status: upstream.status,
+          headers: { 'Content-Type': ct || 'application/vnd.apple.mpegurl' },
+        });
+      } else {
+        // Binary content (TS segments, MP4 init, etc.) — MUST use arrayBuffer,
+        // not text(), to avoid UTF-8 re-encoding corrupting the binary stream.
+        const body = await upstream.arrayBuffer();
+        return cors(body, {
+          status: upstream.status,
+          headers: {
+            'Content-Type':  ct || 'application/octet-stream',
+            'Cache-Control': 'public, max-age=86400',
+          },
+        });
       }
-
-      return cors(responseBody, {
-        status: upstream.status,
-        headers: { 'Content-Type': ct || 'application/octet-stream' },
-      });
     } catch (err) {
       return json({ error: err.message }, 502);
     }

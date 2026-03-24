@@ -2,6 +2,10 @@
 
 // ─── Environment detection ─────────────────────────────────────────────────────
 const isElectron = !!window.electronAPI;
+const isIOS = !isElectron && (
+  /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+);
 
 // ── Cloudflare Worker base URL (only used in web / iPad mode) ─────────────────
 // Replace with your deployed worker URL before publishing the web build.
@@ -968,6 +972,22 @@ function launchPlayer(streamUrl) {
   if (_artEl) _artEl.innerHTML = '';
   playerPlaceholder.classList.add('hidden');
 
+  // In web / iOS mode route the m3u8 through the Worker proxy so all segment
+  // requests also go through /proxy with correct Referer + CORS headers.
+  const playUrl = isElectron
+    ? streamUrl
+    : `${WORKER_URL}/proxy?url=${encodeURIComponent(streamUrl)}&referer=${encodeURIComponent('https://huavod.net/')}`;
+
+  // Debug overlay — shows while a segment is actively loading (web mode only).
+  let debugEl = null;
+  if (!isElectron) {
+    debugEl = document.createElement('div');
+    debugEl.style.cssText = 'position:absolute;bottom:52px;left:8px;color:#fff;font-size:11px;' +
+      'background:rgba(0,0,0,.65);padding:2px 8px;border-radius:3px;z-index:9999;pointer-events:none;display:none';
+    debugEl.textContent = '[Debug] Loading segment...';
+    document.getElementById('artplayer').appendChild(debugEl);
+  }
+
   let bitrateInfoEl = null;      // 闭包变量，ready 后赋值，FRAG_LOADED 直接引用
   let pendingRestoreMsg = '';    // MANIFEST_PARSED 里设置，play 事件里显示
 
@@ -990,9 +1010,12 @@ function launchPlayer(streamUrl) {
 
   dpInstance = new Artplayer({
     container: document.getElementById('artplayer'),
-    url: streamUrl,
+    url: playUrl,
+    type: 'm3u8',
     theme: '#7c3aed',
     autoplay: true,
+    muted: !isElectron,      // Web/iOS: start muted so autoplay is allowed
+    playsinline: true,       // Prevent iOS fullscreen hijack
     autoSize: true,
     fullscreen: true,
     fullscreenWeb: true,
@@ -1047,7 +1070,10 @@ function launchPlayer(streamUrl) {
           art.hls = hls;
           art.on('destroy', () => hls.destroy());
 
+          hls.on(Hls.Events.FRAG_LOADING, () => { if (debugEl) debugEl.style.display = 'block'; });
+
           hls.on(Hls.Events.FRAG_LOADED, (_e, data) => {
+            if (debugEl) debugEl.style.display = 'none';
             try {
               // 跳过 init segment（sn 为 'initSegment'，没有有效 duration）
               if (!data.frag || data.frag.sn === 'initSegment') return;
