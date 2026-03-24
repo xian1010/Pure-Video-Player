@@ -9,7 +9,7 @@ const isIOS = !isElectron && (
 
 // ── Cloudflare Worker base URL (only used in web / iPad mode) ─────────────────
 // Replace with your deployed worker URL before publishing the web build.
-const WORKER_URL = 'https://pure-video-proxy.yapshiuxian.workers.dev';
+const WORKER_URL = 'https://pure-video-proxy.yapshiuxian.workers.dev'.replace(/\/$/, '');
 
 // ─── Screen console (intercepts errors → visible on iPad, no F12 needed) ───
 if (!isElectron) {
@@ -1296,6 +1296,7 @@ function triggerSniff(url, sourceName = '') {
   isSniffing = true;
   opSkipped = false;
   edSkipTriggered = false;
+  sniffFallbackCount = 0;   // always reset so each fresh triggerSniff gets one retry
   hideAllToasts();
 
   // 提前销毁现有的播放器，防止后台继续播放或报错
