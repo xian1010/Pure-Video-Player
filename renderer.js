@@ -1,5 +1,22 @@
 'use strict';
 
+// ── SHARED_UA: must match exactly what main.js uses ──────────────────────────
+const SHARED_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+
+// ── remote-logic.js: xiaobaotv.tv 解析引擎（秒开优化 + 多重备选选择器）────────
+// remote-logic.js 通过 <script src> 加载，挂载在 window 上
+// 注意：必须等 remote-logic.js 执行完才能访问，所以放在文件顶部靠前位置
+function getRemoteLogic() {
+  return {
+    parseCards:   typeof window.parseCards   === 'function' ? window.parseCards   : function(h) { return []; },
+    hasNextPage:  typeof window.hasNextPage  === 'function' ? window.hasNextPage  : function(h) { return false; },
+    parseDetail:  typeof window.parseDetail  === 'function' ? window.parseDetail  : function(h) { return []; },
+    parseFilter:  typeof window.parseFilter  === 'function' ? window.parseFilter  : function(h) { return { areas: [], years: [] }; },
+    extractStreamFromHtml: typeof window.extractStreamFromHtml === 'function' ? window.extractStreamFromHtml : function(h) { return null; },
+    isValidM3u8Url: typeof window.isValidM3u8Url === 'function' ? window.isValidM3u8Url : function(u) { return u && /^https?:\/\//.test(u) && u.toLowerCase().indexOf('.m3u8') !== -1; },
+  };
+}
+
 const catalogView = document.getElementById('catalog-view');
 const playerView = document.getElementById('player-view');
 const cardGrid = document.getElementById('card-grid');
@@ -33,25 +50,10 @@ const skipOpInput = document.getElementById('skip-op-input');
 const skipEdInput = document.getElementById('skip-ed-input');
 const skipClearBtn = document.getElementById('skip-clear-btn');
 
-// Window controls
-document.getElementById('btn-min').onclick = () => window.electronAPI.minimize();
-document.getElementById('btn-max').onclick = () => window.electronAPI.maximize();
-document.getElementById('btn-close').onclick = () => {
-  if (typeof dpInstance !== 'undefined' && dpInstance && currentVodID && dpInstance.video.currentTime > 0) {
-    window.electronAPI.saveHistory({
-      vodID: currentVodID,
-      episodeIndex: currentEpIndex,
-      currentTime: dpInstance.video.currentTime
-    });
-  }
-  window.electronAPI.close();
-};
-
 // ─── App State ────────────────────────────────────────────────────────────────
-// The ONE AND ONLY source of truth for the catalog list
 let currentParams = {
-  baseCatId: 0,  // 顶层频道 tab 的 ID（0=全部, 1=电影, 2=电视剧, 3=综艺, 4=动漫）
-  id: 0,         // 实际请求 ID（可能是子分类, 如 15=港台剧）
+  baseCatId: 0,  // 顶层频道 tab 的 ID（0=全部, 1=电影, 2=电视剧, 3=综艺, 4=动漫, 5=短剧）
+  id: 0,         // 实际请求 ID（可能是子分类）
   area: '',
   year: '',
   page: 1,
@@ -65,9 +67,190 @@ const state = {
   hasMore: false,
   loading: false,
   scrollTop: 0,
+  pageLoaded: false,
 };
 
 let currentFetchId = 0;
+
+// ─── Simple fetch — xiaobaotv.tv has no Cloudflare ─────────────────────────────
+async function fetchHTML(url) {
+  var resp = await window.electronAPI.mainFetch(url);
+  var status = resp.status;
+  var txt = resp.body || '';
+
+  console.log('[Renderer] fetchHTML status=' + status + ' body=' + txt.length + ' isCF=' + resp.isCF);
+
+  if (status === 0 && resp.error) {
+    console.error('[Renderer] fetch error: ' + resp.error);
+    throw new Error(resp.error);
+  }
+
+  return txt;
+}
+
+// ─── DOM Parsers for xiaobaotv.tv (via remote-logic.js) ──────────────────────
+// All parsers are imported from remote-logic.js at the top of this file.
+// Legacy inline functions kept as fallbacks only.
+// ─── Legacy fallback parsers (used only if remote-logic.js is unavailable) ───
+function _legacyParseCards(html) {
+  var parser = new DOMParser();
+  var doc = parser.parseFromString(html, 'text/html');
+  var cards = [];
+  // xiaobaotv.tv uses: ul.myui-vodlist li.col-lg-8 a.myui-vodlist__thumb
+  var els = doc.querySelectorAll('ul.myui-vodlist li a.myui-vodlist__thumb');
+  els.forEach(function(el) {
+    var href = (el.getAttribute('href') || '').trim();
+    if (!href.includes('/movie/detail/')) return;
+    var poster = (el.getAttribute('data-original') || '').trim();
+    if (poster && !poster.startsWith('http')) {
+      if (poster.startsWith('/')) poster = 'https://www.xiaobaotv.tv' + poster;
+      else poster = 'https://www.xiaobaotv.tv/' + poster;
+    }
+    var title = el.getAttribute('title') || '';
+    if (!title) {
+      var titleEl = el.querySelector('span.pic-text');
+      if (titleEl) title = titleEl.textContent.trim();
+    }
+    var badge = '';
+    var tagEl = el.querySelector('span.pic-tag-top span.tag');
+    if (tagEl) badge = tagEl.textContent.trim();
+    if (title && href.includes('/movie/detail/')) {
+      if (!href.startsWith('http')) href = 'https://www.xiaobaotv.tv' + href;
+      cards.push({ title: title, url: href, poster: poster, badge: badge });
+    }
+  });
+  var nextLink = doc.querySelector('a[href*="/movie/type/"][href*=".html"]:not([href*="page=1"])');
+  var nextPage = false;
+  if (nextLink) {
+    var href = nextLink.getAttribute('href');
+    nextPage = href && !href.includes('-1.html');
+  }
+  if (!nextPage) {
+    var pageLinks = doc.querySelectorAll('a.myui-page__a');
+    for (var i = 0; i < pageLinks.length; i++) {
+      var ph = pageLinks[i].getAttribute('href') || '';
+      if (ph.includes('type/') && (ph.match(/type\/\d+-\d+\.html/) || ph.match(/show\/\d+-\d+\.html/))) {
+        nextPage = true; break;
+      }
+    }
+  }
+  return { cards: cards, nextPage: nextPage };
+}
+
+function _legacyParseDetail(html) {
+  var parser = new DOMParser();
+  var doc = parser.parseFromString(html, 'text/html');
+  var sources = [];
+  var playLinks = doc.querySelectorAll('a[href*="/movie/play/"]').length;
+  var panelCount = doc.querySelectorAll('div.myui-panel').length;
+  var ulCount = doc.querySelectorAll('ul').length;
+  var btnLinks = doc.querySelectorAll('a.btn').length;
+  console.log('[LEGACY parseDetail] HTML长度=' + html.length + ' | play链接=' + playLinks + ' | myui-panel=' + panelCount + ' | ul=' + ulCount + ' | a.btn=' + btnLinks);
+  var panels = doc.querySelectorAll('div.myui-panel');
+  var currentSourceName = '默认线路';
+  var currentEpisodes = [];
+  var seen = {};
+  panels.forEach(function(panel) {
+    var epLinks = panel.querySelectorAll('a[href*="/movie/play/"]');
+    if (epLinks.length === 0) return;
+    var heading = panel.querySelector('h3, .myui-panel__head, .myui-panel__box h3, h3.title');
+    if (heading) {
+      var hText = heading.textContent.replace(/[\n\r\s]+/g, '').trim();
+      if (hText && hText !== '猜你喜欢' && hText !== '剧情简介' && hText !== '本月热门' && hText !== '香港剧本周热播') {
+        currentSourceName = hText;
+      }
+    }
+    epLinks.forEach(function(aEl) {
+      var href = aEl.getAttribute('href') || '';
+      var title = aEl.textContent.trim() || '';
+      if (title.length < 40 && !seen[href]) {
+        seen[href] = true;
+        if (!href.startsWith('http')) href = 'https://www.xiaobaotv.tv' + href;
+        currentEpisodes.push({ title: title, url: href });
+      }
+    });
+  });
+  if (currentEpisodes.length === 0) {
+    var allLinks = doc.querySelectorAll('a[href*="/movie/play/"]');
+    var defaultSrc = { name: '默认线路', episodes: [] };
+    var seenEp = {};
+    allLinks.forEach(function(aEl) {
+      var href = aEl.getAttribute('href') || '';
+      var title = aEl.textContent.trim() || '';
+      if (title.length < 40 && !seenEp[href]) {
+        seenEp[href] = true;
+        if (!href.startsWith('http')) href = 'https://www.xiaobaotv.tv' + href;
+        defaultSrc.episodes.push({ title: title, url: href });
+      }
+    });
+    if (defaultSrc.episodes.length > 0) sources.push(defaultSrc);
+  } else if (currentEpisodes.length > 0) {
+    sources.push({ name: currentSourceName, episodes: currentEpisodes });
+  }
+  console.log('[LEGACY parseDetail] 返回 sources.length=' + sources.length);
+  if (sources.length > 0) {
+    sources.forEach(function(s, i) { console.log('[LEGACY]  线路' + i + ': "' + s.name + '" — ' + s.episodes.length + ' 集'); });
+  }
+  return sources;
+}
+
+function _legacyParseFilter(html) {
+  var parser = new DOMParser();
+  var doc = parser.parseFromString(html, 'text/html');
+  var areas = [], years = [];
+  var seenAreas = {}, seenYears = {};
+  doc.querySelectorAll('a[href*="/movie/show/"][href*="/area/"]').forEach(function(el) {
+    var m = el.getAttribute('href').match(/\/area\/([^./]+)/);
+    if (!m) return;
+    var v;
+    try { v = decodeURIComponent(m[1]); } catch(_e) { v = m[1]; }
+    if (v && !seenAreas[v]) { seenAreas[v] = true; areas.push(v); }
+  });
+  doc.querySelectorAll('a[href*="/movie/show/"][href*="/year/"]').forEach(function(el) {
+    var m = el.getAttribute('href').match(/\/year\/(\d{4})/);
+    if (m && !seenYears[m[1]]) { seenYears[m[1]] = true; years.push(m[1]); }
+  });
+  years.sort(function(a, b) { return Number(b) - Number(a); });
+  return { areas: areas, years: years };
+}
+
+// ─── Unified card parser (remote-logic primary, legacy fallback) ─────────────
+function unifiedParseCards(html) {
+  var rl = getRemoteLogic();
+  var result = rl.parseCards(html);
+  if (result && result.length > 0 && typeof result[0] === 'object' && result[0].title) {
+    // remote-logic returned cards array directly — wrap it with nextPage
+    var np = false;
+    try { np = rl.hasNextPage(html); } catch(e) {}
+    return { cards: result, nextPage: np };
+  }
+  // remote-logic returned { cards, nextPage } object
+  if (result && Array.isArray(result.cards)) return result;
+  // Fallback to legacy
+  return _legacyParseCards(html);
+}
+
+// ─── Unified detail parser ───────────────────────────────────────────────────
+function unifiedParseDetail(html) {
+  var rl = getRemoteLogic();
+  var result = rl.parseDetail(html);
+  console.log('[DEBUG unifiedParseDetail] 方法1结果:', result && result.length, 'sources');
+  if (result && Array.isArray(result) && result.length > 0) return result;
+
+  // 也试 legacy
+  var legacy = _legacyParseDetail(html);
+  console.log('[DEBUG unifiedParseDetail] legacy 结果:', legacy && legacy.length, 'sources');
+  if (legacy && Array.isArray(legacy) && legacy.length > 0) return legacy;
+  return [];
+}
+
+// ─── Unified filter parser ───────────────────────────────────────────────────
+function unifiedParseFilter(html) {
+  var rl = getRemoteLogic();
+  var result = rl.parseFilter(html);
+  if (result && (Array.isArray(result.areas) || Array.isArray(result.years))) return result;
+  return _legacyParseFilter(html);
+}
 
 let epSortDesc = false;
 let opSkipped = false;
@@ -77,7 +260,7 @@ let currentSourceEpisodes = [];
 let currentVodID = '';
 let currentEpIndex = 0;
 let currentEpUrl = '';
-let sniffFallbackCount = 0; // Prevent infinite re-sniff loops on dead links
+let sniffFallbackCount = 0;
 let lastWatchedTime = 0;
 let hasRestoredTime = false;
 let saveHistoryInterval = null;
@@ -88,37 +271,22 @@ function clearSaveHistoryInterval() {
 }
 
 // ─── Sub-category definitions per channel ─────────────────────────────────────
-// label: display text; id: vodshow sub-category ID
+// xiaobaotv.tv: movie/type/<id>.html
 const SUBCAT_DEFS = {
   1: [ // 电影
     { label: '全部', id: 1 },
-    { label: '动作', id: 7 },
-    { label: '喜剧', id: 9 },
-    { label: '爱情', id: 9 },
-    { label: '科幻', id: 6 },
-    { label: '战争', id: 10 },
-    { label: '动画', id: 11 },
-    { label: '纪录片', id: 12 },
   ],
   2: [ // 电视剧
     { label: '全部', id: 2 },
-    { label: '大陆剧', id: 14 },
-    { label: '港台剧', id: 15 },
-    { label: '日韩剧', id: 16 },
-    { label: '欧美剧', id: 17 },
-    { label: '其他剧', id: 18 },
   ],
   3: [ // 综艺
     { label: '全部', id: 3 },
-    { label: '内地综艺', id: 19 },
-    { label: '港台综艺', id: 20 },
-    { label: '日韩综艺', id: 21 },
-    { label: '欧美综艺', id: 22 },
   ],
   4: [ // 动漫
     { label: '全部', id: 4 },
-    { label: '国产动漫', id: 23 },
-    { label: '日本动漫', id: 24 },
+  ],
+  5: [ // 短剧
+    { label: '全部', id: 5 },
   ],
 };
 
@@ -139,8 +307,7 @@ function renderSubcatRow(baseCatId) {
   });
 }
 
-// Map id=0 to two requests (电影+电视剧) for the "全部" tab
-const CAT_IDS = { 0: [1, 2, 3, 4], 1: [1], 2: [2], 3: [3], 4: [4] };
+const CAT_IDS = { 0: [1], 1: [1], 2: [2], 3: [3], 4: [4], 5: [5] };
 
 // ─── Filter helpers ────────────────────────────────────────────────────────────
 function updateFilterBar() {
@@ -148,7 +315,6 @@ function updateFilterBar() {
   filterBar.classList.toggle('hidden', !showFilter);
 }
 
-// Populate one chip row: always starts with '全部', then the provided values
 function renderFilterChips(container, values, activeVal) {
   container.innerHTML = '';
   ['', ...values].forEach(val => {
@@ -160,15 +326,14 @@ function renderFilterChips(container, values, activeVal) {
   });
 }
 
-// Async: fetch real area/year options from the site for catId, then render chips
 async function loadFilterOptions(catId) {
-  // Show only '全部' while loading
   renderFilterChips(areaChips, [], '');
   renderFilterChips(yearChips, [], '');
   try {
-    const opts = await window.electronAPI.fetchFilterOptions(catId);
-    renderFilterChips(areaChips, opts.areas || [], currentParams.area);
-    renderFilterChips(yearChips, opts.years || [], currentParams.year);
+    var html = await fetchHTML('https://www.xiaobaotv.tv/movie/type/' + catId + '.html');
+    var opts = unifiedParseFilter(html);
+    renderFilterChips(areaChips, (opts.areas || []).slice(0, 20), currentParams.area);
+    renderFilterChips(yearChips, (opts.years || []).slice(0, 20), currentParams.year);
   } catch (err) {
     console.warn('[FilterOptions]', err);
   }
@@ -178,11 +343,9 @@ function resetFilterChips() {
   currentParams.area = '';
   currentParams.year = '';
   currentParams.id = currentParams.baseCatId;
-  // Visual reset: make first chip ('全部') active in all rows
   [areaChips, yearChips].forEach(container =>
     container.querySelectorAll('.filter-chip').forEach((c, i) => c.classList.toggle('active', i === 0))
   );
-  // 重置分类芯片到第一项（全部）
   if (subcatChips) subcatChips.querySelectorAll('.filter-chip').forEach((c, i) => c.classList.toggle('active', i === 0));
 }
 
@@ -191,7 +354,6 @@ function showCatalog() {
   state.view = 'catalog';
   catalogView.classList.remove('hidden-left', 'hidden-right');
   playerView.classList.add('hidden-right');
-  // Restore scroll
   requestAnimationFrame(() => { gridScroll.scrollTop = state.scrollTop; });
   updateFilterBar();
 }
@@ -204,19 +366,17 @@ function showPlayer(autoUrl = '') {
   if (autoUrl) playerUrlInput.value = autoUrl;
 }
 
-// ─── Card Rendering ───────────────────────────────────────────────────────────
+// ─── Card Rendering ──────────────────────────────────────────────────────────
 const PROXY = (url) => url ? `imgproxy://${encodeURIComponent(url)}` : '';
 
-function renderCards(items, append = false) {
+function renderCards(items, append = false, forceClear = false) {
   if (!append) cardGrid.innerHTML = '';
 
-  if (!items.length && !append) {
-    gridEmpty.classList.add('show');
-    emptyMsg.textContent = currentParams.isFavorites
-      ? '收藏夹是空的，点击卡片上的 ★ 来添加'
-      : currentParams.isSearch ? `未找到"${currentParams.query}"的结果` : '暂无内容';
-    loadMoreBtn.disabled = true;
-    return;
+  if (!items.length && !append && !forceClear && !currentParams.isSearch && !currentParams.isFavorites) {
+    if (cardGrid.querySelector('.movie-card')) {
+      loadMoreBtn.disabled = !state.hasMore;
+      return;
+    }
   }
   gridEmpty.classList.remove('show');
 
@@ -243,14 +403,12 @@ function renderCards(items, append = false) {
       </div>`;
     card.addEventListener('click', () => onCardClick(item));
 
-    // Star button: toggles favorite without triggering card click
     const favBtn = card.querySelector('.card-fav-btn');
     favBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       const nowFaved = toggleFavorite(item);
       favBtn.classList.toggle('active', nowFaved);
       updateFavTabLabel();
-      // If we're in the favorites view and just un-favorited, remove the card live
       if (currentParams.isFavorites && !nowFaved) {
         card.remove();
         if (!cardGrid.querySelector('.movie-card')) {
@@ -283,7 +441,6 @@ function escHtml(s) {
 
 // ─── Favorites (localStorage) ─────────────────────────────────────────────────
 const FAV_KEY = 'pvp_favorites';
-
 function getFavorites() {
   try { return JSON.parse(localStorage.getItem(FAV_KEY) || '[]'); } catch { return []; }
 }
@@ -330,14 +487,13 @@ function updateSkipUI() {
   skipEdInput.value = ed;
 }
 
-// ─── Data Loading (Unified) ─────────────────────────────────────────────────────
+// ─── Data Loading ─────────────────────────────────────────────────────────────
 async function reloadCatalog() {
   const fetchId = ++currentFetchId;
   state.loading = true;
   catalogStatus.textContent = '加载中…';
   loadMoreBtn.disabled = true;
 
-  // Instant UI clear
   cardGrid.innerHTML = '';
   gridEmpty.classList.remove('show');
   renderGhosts();
@@ -351,20 +507,23 @@ async function reloadCatalog() {
       allItems = getFavorites();
       anyMore = false;
     } else if (currentParams.isSearch) {
-      const res = await window.electronAPI.scrapeSearch(currentParams.query, currentParams.page);
-      allItems = res.items || [];
-      anyMore = res.hasMore;
-      if (res.error) throw new Error(res.error);
+      // xiaobaotv.tv search: /search.html?wd=<query>
+      var searchUrl = 'https://www.xiaobaotv.tv/search.html?wd=' + encodeURIComponent(currentParams.query);
+      var html = await fetchHTML(searchUrl);
+      var res = unifiedParseCards(html);
+      allItems = res.cards;
+      anyMore = res.nextPage;
     } else {
-      const cats = currentParams.page === 1
-        ? (CAT_IDS[currentParams.id] || [currentParams.id === 0 ? 1 : currentParams.id])
-        : [currentParams.id === 0 ? 1 : currentParams.id];
-
-      const results = await Promise.all(
-        cats.map(id => window.electronAPI.scrapeCategory(id, currentParams.page, currentParams.area, currentParams.year))
-      );
-      results.forEach(r => { allItems.push(...(r.items || [])); anyMore = anyMore || r.hasMore; });
-      if (results[0]?.error) throw new Error(results[0].error);
+      var id = (currentParams.id === 0) ? currentParams.baseCatId : currentParams.id;
+      if (id === 0) id = 1;
+      var urlPath = '/movie/type/' + id;
+      if (currentParams.area && currentParams.area !== '全部') urlPath += '/area/' + encodeURIComponent(currentParams.area);
+      if (currentParams.year && currentParams.year !== '全部') urlPath += '/year/' + currentParams.year;
+      urlPath += currentParams.page > 1 ? '-' + currentParams.page + '.html' : '.html';
+      var html2 = await fetchHTML('https://www.xiaobaotv.tv' + urlPath);
+      var res2 = unifiedParseCards(html2);
+      allItems = res2.cards;
+      anyMore = res2.nextPage;
     }
 
     if (fetchId !== currentFetchId) return;
@@ -376,18 +535,20 @@ async function reloadCatalog() {
     renderCards(allItems, false);
     catalogStatus.textContent = '';
 
-    // As requested: dump top 3 titles to console to verify data changed
     const top3 = allItems.slice(0, 3).map(i => i.title).join(' | ');
-    console.log(`[Scraper] Parsed top 3: ${top3 || 'None'}`);
+    console.log('[Catalog] Parsed top 3: ' + (top3 || 'None'));
+
   } catch (err) {
     if (fetchId !== currentFetchId) return;
     const ghosts = cardGrid.querySelectorAll('.ghost-card');
     ghosts.forEach(g => g.remove());
+
     gridEmpty.classList.add('show');
-    emptyMsg.innerHTML = `加载失败: ${err.message}<br><br><button id="btn-retry-catalog" class="ep-btn" style="padding: 6px 16px; font-size: 14px; margin-top: 10px;">点击重试</button>`;
-    const retryBtn = document.getElementById('btn-retry-catalog');
-    if (retryBtn) retryBtn.addEventListener('click', reloadCatalog);
+    emptyMsg.innerHTML = '加载失败: ' + escHtml(err.message || String(err)) + '<br><br><button id="btn-retry-catalog" class="ep-btn" style="padding: 6px 16px; font-size: 14px; margin-top: 10px;">点击重试</button>';
     catalogStatus.textContent = '';
+
+    const retryBtn = document.getElementById('btn-retry-catalog');
+    if (retryBtn) retryBtn.addEventListener('click', () => reloadCatalog());
     console.error('[Catalog]', err);
   } finally {
     if (fetchId === currentFetchId) state.loading = false;
@@ -396,7 +557,7 @@ async function reloadCatalog() {
 
 async function loadPage(append = false) {
   if (state.loading && append) return;
-  if (!append) return reloadCatalog(); // safeguard for old calls
+  if (!append) return reloadCatalog();
 
   const fetchId = ++currentFetchId;
   state.loading = true;
@@ -411,17 +572,22 @@ async function loadPage(append = false) {
       allItems = getFavorites();
       anyMore = false;
     } else if (currentParams.isSearch) {
-      const res = await window.electronAPI.scrapeSearch(currentParams.query, currentParams.page);
-      allItems = res.items || [];
-      anyMore = res.hasMore;
-      if (res.error) throw new Error(res.error);
+      var searchUrl = 'https://www.xiaobaotv.tv/search.html?wd=' + encodeURIComponent(currentParams.query);
+      var html = await fetchHTML(searchUrl);
+      var res = unifiedParseCards(html);
+      allItems = res.cards;
+      anyMore = res.nextPage;
     } else {
-      const cats = [currentParams.id === 0 ? 1 : currentParams.id];
-      const results = await Promise.all(
-        cats.map(id => window.electronAPI.scrapeCategory(id, currentParams.page, currentParams.area, currentParams.year))
-      );
-      results.forEach(r => { allItems.push(...(r.items || [])); anyMore = anyMore || r.hasMore; });
-      if (results[0]?.error) throw new Error(results[0].error);
+      var id = (currentParams.id === 0) ? currentParams.baseCatId : currentParams.id;
+      if (id === 0) id = 1;
+      var urlPath = '/movie/type/' + id;
+      if (currentParams.area && currentParams.area !== '全部') urlPath += '/area/' + encodeURIComponent(currentParams.area);
+      if (currentParams.year && currentParams.year !== '全部') urlPath += '/year/' + currentParams.year;
+      urlPath += currentParams.page > 1 ? '-' + currentParams.page + '.html' : '.html';
+      var html2 = await fetchHTML('https://www.xiaobaotv.tv' + urlPath);
+      var res2 = unifiedParseCards(html2);
+      allItems = res2.cards;
+      anyMore = res2.nextPage;
     }
 
     if (fetchId !== currentFetchId) return;
@@ -429,10 +595,11 @@ async function loadPage(append = false) {
     state.hasMore = anyMore;
     renderCards(allItems, true);
     catalogStatus.textContent = '';
+
   } catch (err) {
     if (fetchId !== currentFetchId) return;
-    catalogStatus.innerHTML = `追加失败: ${err.message} <button id="btn-retry-loadmore" style="margin-left:10px; padding:4px 12px; font-size:12px; border-radius:15px; background:linear-gradient(45deg, #7c3aed, #ec4899); border:none; color:white; cursor:pointer;">点击重试</button>`;
-    const retryBtn = document.getElementById('btn-retry-loadmore');
+    catalogStatus.innerHTML = '追加失败: ' + escHtml(err.message || String(err)) + ' <button id="btn-retry-loadmore" style="margin-left:10px; padding:4px 12px; font-size:12px; border-radius:15px; background:linear-gradient(45deg, #7c3aed, #ec4899); border:none; color:white; cursor:pointer;">点击重试</button>';
+    var retryBtn = document.getElementById('btn-retry-loadmore');
     if (retryBtn) retryBtn.addEventListener('click', loadMore);
     console.error('[loadMore]', err);
   } finally {
@@ -445,15 +612,16 @@ async function loadMore() {
   await loadPage(true);
 }
 
-// ─── Fetch Episodes ─────────────────────────────────────────────────────────────
+// ─── Fetch Episodes ──────────────────────────────────────────────────────────
 function fetchEpisodes(url) {
   epContainer.classList.add('hidden');
   epGrid.innerHTML = '';
   sourceTabBar.innerHTML = '';
   sourceTabBar.classList.add('hidden');
 
+  // xiaobaotv.tv: /movie/detail/<id>.html → extract vodID
   currentVodID = url;
-  const m = url.match(/\/voddetail\/(\d+)/);
+  var m = url.match(/\/movie\/detail\/(\d+)/);
   if (m) currentVodID = m[1];
 
   lastWatchedTime = 0;
@@ -461,20 +629,58 @@ function fetchEpisodes(url) {
   currentEpIndex = 0;
   updateSkipUI();
 
-  if (url.includes('/voddetail/')) {
+  if (url.includes('/movie/detail/')) {
     setPlayerLoading(true);
     setPlayerStatus('🔍 获取剧集列表…', 'loading');
 
     Promise.all([
-      window.electronAPI.getDetail(url),
+      fetchHTML(url).then(function(html) {
+        // ─── 强力诊断：打印原始 HTML ─────────────────────────────────────────
+        console.log('--- RAW HTML START ---');
+        console.log(html.substring(0, 8000));
+        console.log('--- RAW HTML END ---');
+
+        // ─── 模糊匹配：扫描 HTML 中所有 /movie/play/ 链接 ───────────────────
+        var allPlayLinks = html.match(/href="([^"]*\/movie\/play\/[^"]+)"/gi) || [];
+        var uniqueLinks = {};
+        allPlayLinks.forEach(function(m) {
+          var u = m.match(/href="([^"]+)"/);
+          if (u) uniqueLinks[u[1]] = true;
+        });
+        var linkCount = Object.keys(uniqueLinks).length;
+        console.log('[DEBUG] /movie/play/ 链接总数（去重后）:', linkCount);
+        console.log('[DEBUG] 前 20 个链接:', Object.keys(uniqueLinks).slice(0, 20));
+
+        // ─── 扫描 HTML 中包含 /movie/play/ 的行 ─────────────────────────────
+        var lines = html.split('\n');
+        var playLines = lines.filter(function(l) { return l.indexOf('/movie/play/') !== -1; });
+        console.log('[DEBUG] 含 /movie/play/ 的行数:', playLines.length);
+        if (playLines.length > 0) {
+          console.log('[DEBUG] 前 5 行含 play 的 HTML:');
+          playLines.slice(0, 5).forEach(function(l) { console.log(l.replace(/</g, '&lt;').substring(0, 300)); });
+        }
+
+        // ─── 扫描集数文字（第X集） ─────────────────────────────────────────
+        var jiMatches = html.match(/["']第[\u4e00-\u9fa5a-zA-Z\d]+集["']/g) || [];
+        console.log('[DEBUG] 集数文字匹配:', jiMatches.slice(0, 10));
+
+        return { sources: unifiedParseDetail(html) };
+      }),
       window.electronAPI.getHistory(currentVodID)
     ]).then(([res, history]) => {
-      if (state.view !== 'player') return; // Cancel if navigated away
+      if (state.view !== 'player') return;
 
       setPlayerLoading(false);
       clearPlayerStatus();
       const sources = res.sources || [];
-      if (sources.length === 0) { triggerSniff(url); return; }
+      if (sources.length === 0) {
+        // parseDetail 失败时不传 detail URL 给嗅探器（会超时）
+        // 只提示用户
+        setPlayerStatus('无法解析集数列表，请尝试直接粘贴播放链接', 'error');
+        showToast('无法解析集数列表，请尝试直接粘贴播放链接', 'error');
+        playerPlaceholder.classList.remove('hidden');
+        return;
+      }
 
       if (history) {
         currentEpIndex = history.episodeIndex || 0;
@@ -483,7 +689,6 @@ function fetchEpisodes(url) {
 
       epContainer.classList.remove('hidden');
 
-      // Preferred source: remember last selection across sessions
       const preferred = localStorage.getItem('pvp_preferred_source') || '';
       let activeIdx = 0;
       if (preferred) {
@@ -491,12 +696,10 @@ function fetchEpisodes(url) {
         if (found !== -1) activeIdx = found;
       }
 
-      // Default the currentEpUrl to the active episode's URL in case they don't click
       if (sources[activeIdx] && sources[activeIdx].episodes[currentEpIndex]) {
         currentEpUrl = sources[activeIdx].episodes[currentEpIndex].url;
       }
 
-      // Render source-line tabs (only if there is more than one source)
       if (sources.length > 1) {
         sourceTabBar.classList.remove('hidden');
         sources.forEach((src, i) => {
@@ -508,6 +711,11 @@ function fetchEpisodes(url) {
             btn.classList.add('active');
             localStorage.setItem('pvp_preferred_source', src.name);
             renderSourceEpisodes(src.episodes, currentEpIndex);
+            // 切换线路后自动点击第一集开始嗅探
+            setTimeout(function() {
+              var first = epGrid.querySelector('.ep-btn');
+              if (first) first.click();
+            }, 80);
           };
           sourceTabBar.appendChild(btn);
         });
@@ -515,17 +723,14 @@ function fetchEpisodes(url) {
 
       renderSourceEpisodes(sources[activeIdx].episodes, currentEpIndex);
 
-      // 在异步渲染完成后，自动点击 active 按钮，触发播放
       setTimeout(() => {
-        if (state.view !== 'player') return; // Guard against back button race
+        if (state.view !== 'player') return;
         const activeBtn = epGrid.querySelector('.ep-btn.active');
         if (activeBtn) activeBtn.click();
       }, 50);
 
     }).catch(() => {
-      if (state.view !== 'player') return; // Guard error handling
-
-      // 捕获到 404 或解析失败时，不再显示红色错误，保持 loading 状态
+      if (state.view !== 'player') return;
       setPlayerLoading(true);
       setPlayerStatus('⚡ 正在尝试直接提取播放源…', 'loading');
       setTimeout(() => triggerSniff(url), 500);
@@ -574,7 +779,7 @@ function _renderEpBtns(episodes, activeIndex = 0) {
       }
       currentEpIndex = originalIdx;
       currentEpUrl = ep.url;
-      sniffFallbackCount = 0; // Reset fallback counter for new episode playback
+      sniffFallbackCount = 0;
 
       const activeSourceBtn = document.querySelector('#source-tab-bar .source-tab.active');
       const sourceName = activeSourceBtn ? activeSourceBtn.textContent : '';
@@ -584,13 +789,12 @@ function _renderEpBtns(episodes, activeIndex = 0) {
   });
 }
 
-// ─── Card Click → Trigger Sniffer ─────────────────────────────────────────────
+// ─── Card Click ───────────────────────────────────────────────────────────────
 let currentItem = null;
 
 function onCardClick(item) {
   currentItem = item;
   showPlayer(item.url);
-  // Update the player-view favorite button to reflect this item's state
   const playerFavBtn = document.getElementById('player-fav-btn');
   if (playerFavBtn) {
     playerFavBtn.classList.toggle('active', isFavorited(item.url));
@@ -599,7 +803,7 @@ function onCardClick(item) {
   fetchEpisodes(item.url);
 }
 
-// ─── Category Tabs ────────────────────────────────────────────────────────────
+// ─── Category Tabs ───────────────────────────────────────────────────────────
 catTabs.forEach(tab => {
   tab.addEventListener('click', () => {
     catTabs.forEach(t => t.classList.remove('active'));
@@ -612,18 +816,18 @@ catTabs.forEach(tab => {
     currentParams.isSearch = false;
     currentParams.isFavorites = false;
     currentParams.query = '';
+    state.pageLoaded = false;
 
     renderSubcatRow(currentParams.baseCatId);
     searchInput.value = '';
     resetFilterChips();
     gridScroll.scrollTop = 0;
-    // 动态拉取该频道的真实地区/年份选项（异步，不阻塞内容加载）
     if (currentParams.baseCatId !== 0) loadFilterOptions(currentParams.baseCatId);
     reloadCatalog();
   });
 });
 
-// ─── Favorites Tab ─────────────────────────────────────────────────────────────
+// ─── Favorites Tab ────────────────────────────────────────────────────────────
 const favTab = document.getElementById('fav-tab');
 updateFavTabLabel();
 favTab.addEventListener('click', () => {
@@ -634,12 +838,13 @@ favTab.addEventListener('click', () => {
   currentParams.isSearch = false;
   currentParams.query = '';
   currentParams.page = 1;
+  state.pageLoaded = false;
 
   gridScroll.scrollTop = 0;
   reloadCatalog();
 });
 
-// ─── Search ───────────────────────────────────────────────────────────────────
+// ─── Search ─────────────────────────────────────────────────────────────────
 let searchTimer = null;
 function doSearch() {
   const q = searchInput.value.trim();
@@ -652,6 +857,7 @@ function doSearch() {
   currentParams.query = q;
   currentParams.page = 1;
   currentParams.id = 0;
+  state.pageLoaded = false;
 
   gridScroll.scrollTop = 0;
   console.log('[Search] Triggered, currentParams:', JSON.stringify(currentParams));
@@ -659,16 +865,10 @@ function doSearch() {
 }
 
 searchBtn.addEventListener('click', doSearch);
-searchBtn.addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
-searchInput.addEventListener('keydown', e => {
-  if (e.key === 'Enter') {
-    e.preventDefault();
-    doSearch();
-  }
-});
+searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
 searchInput.addEventListener('input', () => {
   clearTimeout(searchTimer);
-  if (!searchInput.value.trim()) return; // don't auto-search empties
+  if (!searchInput.value.trim()) return;
   searchTimer = setTimeout(doSearch, 500);
 });
 
@@ -690,31 +890,29 @@ filterBar.addEventListener('click', e => {
   const val = chip.dataset.val;
 
   if (inSubcat) {
-    // 切换子分类 → 重置地区和年份，并拉取该子分类的筛选项
     currentParams.id = parseInt(val, 10);
     currentParams.area = '';
     currentParams.year = '';
     areaChips.querySelectorAll('.filter-chip').forEach(c => c.classList.toggle('active', c.dataset.val === ''));
     yearChips.querySelectorAll('.filter-chip').forEach(c => c.classList.toggle('active', c.dataset.val === ''));
-    loadFilterOptions(currentParams.id); // 动态更新地区/年份选项
+    loadFilterOptions(currentParams.id);
   } else if (inArea) {
-    // 地区只追加参数，不改 id
     currentParams.area = val;
   } else {
-    // 年份只追加参数，不改 id / area
     currentParams.year = val;
   }
 
   currentParams.page = 1;
   currentParams.isSearch = false;
   currentParams.isFavorites = false;
+  state.pageLoaded = false;
   console.log('[Filter] currentParams:', JSON.stringify(currentParams));
 
   gridScroll.scrollTop = 0;
   reloadCatalog();
 });
 
-// ─── Load More Button + Intersection Observer ─────────────────────────────────
+// ─── Load More + Intersection Observer ────────────────────────────────────────
 loadMoreBtn.addEventListener('click', loadMore);
 
 const observer = new IntersectionObserver(entries => {
@@ -724,7 +922,6 @@ observer.observe(scrollSentinel);
 
 // ─── Back Button ──────────────────────────────────────────────────────────────
 backBtn.addEventListener('click', () => {
-  // 先保存历史，再清理 video 元素（否则 removeAttribute src 会把 currentTime 归零）
   if (dpInstance && currentVodID && dpInstance.video && dpInstance.video.currentTime > 0) {
     window.electronAPI.saveHistory({
       vodID: currentVodID,
@@ -733,32 +930,19 @@ backBtn.addEventListener('click', () => {
     });
   }
 
-  // 暴力清除页面上所有的 video 标签，确保绝无余音
   document.querySelectorAll('video').forEach(v => {
-    try {
-      v.pause();
-      v.removeAttribute('src');
-      v.load();
-      v.remove();
-    } catch (_) { }
+    try { v.pause(); v.removeAttribute('src'); v.load(); v.remove(); } catch (_) { }
   });
 
   hideNextCountdownToast();
   clearSaveHistoryInterval();
-  if (globalErrorToastTimer) {
-    clearTimeout(globalErrorToastTimer);
-    globalErrorToastTimer = null;
-  }
+  if (globalErrorToastTimer) { clearTimeout(globalErrorToastTimer); globalErrorToastTimer = null; }
 
-  // 1. Immediately silence and destroy the HLS pipeline + DPlayer
   if (dpInstance) {
     try {
       dpInstance.pause();
       dpInstance.src = '';
-      if (dpInstance.video) {
-        dpInstance.video.muted = true;
-        dpInstance.video.src = '';
-      }
+      if (dpInstance.video) { dpInstance.video.muted = true; dpInstance.video.src = ''; }
     } catch (_) { }
     try { if (dpInstance.hls) { dpInstance.hls.destroy(); dpInstance.hls = null; } } catch (_) { }
     try { dpInstance.destroy(); } catch (_) { }
@@ -767,13 +951,9 @@ backBtn.addEventListener('click', () => {
   const _artEl1 = document.getElementById('artplayer');
   if (_artEl1) _artEl1.innerHTML = '';
 
-  // 2. Tell the main process to forcibly destroy the sniffer window
-  if (window.electronAPI.sendStopSniffing) {
-    window.electronAPI.sendStopSniffing(); // Matches ipcRenderer.send('stop-sniffing')
-  }
+  window.electronAPI.sendStopSniffing();
   window.electronAPI.stopSniff();
 
-  // 3. Reset player view to its initial state
   epContainer.classList.add('hidden');
   epGrid.innerHTML = '';
   sourceTabBar.innerHTML = '';
@@ -787,7 +967,7 @@ backBtn.addEventListener('click', () => {
 
 // ─── Player Sniff Logic ───────────────────────────────────────────────────────
 let dpInstance = null;
-let isSniffing       = false;
+let isSniffing = false;
 let globalErrorToastTimer = null;
 
 function setPlayerStatus(msg, type = 'info') {
@@ -815,7 +995,7 @@ function launchPlayer(streamUrl) {
   if (_artEl) _artEl.innerHTML = '';
   playerPlaceholder.classList.add('hidden');
 
-  let bitrateInfoEl   = null;
+  let bitrateInfoEl = null;
   let pendingRestoreMsg = '';
 
   const activeSourceBtn = document.querySelector('#source-tab-bar .source-tab.active');
@@ -824,7 +1004,7 @@ function launchPlayer(streamUrl) {
 
   const plugins = [];
   if (is4K && typeof artplayerPluginHevcWasm === 'function') {
-    showToast('已为 4K 线路注入 WASM软解支持', 'success');
+    showToast('已为 4K 线路注入 WASM 软解支持', 'success');
     plugins.push(artplayerPluginHevcWasm());
   }
 
@@ -873,12 +1053,7 @@ function launchPlayer(streamUrl) {
     ],
     customType: {
       m3u8: function (video, url, art) {
-        // Destroy any previous HLS instance — this fires on both first load
-        // and every subsequent switchUrl() call.
-        if (art.hls) {
-          try { art.hls.destroy(); } catch (_) {}
-          art.hls = null;
-        }
+        if (art.hls) { try { art.hls.destroy(); } catch (_) {} art.hls = null; }
         if (Hls.isSupported()) {
           const hls = new Hls({
             enableWorker: true,
@@ -896,36 +1071,24 @@ function launchPlayer(streamUrl) {
           art.hls = hls;
           art.on('destroy', () => hls.destroy());
 
-          hls.on(Hls.Events.FRAG_LOADING, () => {});
-
           hls.on(Hls.Events.FRAG_LOADED, (_e, data) => {
             try {
-              // 跳过 init segment（sn 为 'initSegment'，没有有效 duration）
               if (!data.frag || data.frag.sn === 'initSegment') return;
-              // hls.js v1.x: payload 是 ArrayBuffer；fallback 到 frag.stats.loaded
               const sizeBytes = (data.payload && data.payload.byteLength > 0 ? data.payload.byteLength : 0)
-                || (data.frag.stats && data.frag.stats.loaded)
-                || 0;
+                || (data.frag.stats && data.frag.stats.loaded) || 0;
               const dur = data.frag.duration || 0;
-              console.log('[Bitrate] FRAG_LOADED sn=', data.frag.sn, 'size=', sizeBytes, 'dur=', dur);
               if (sizeBytes > 0 && dur > 0) {
                 const mbps = (sizeBytes * 8 / (dur * 1000000)).toFixed(2);
-                console.log('[Bitrate] Calculated:', mbps, 'Mbps');
                 const infoTarget = bitrateInfoEl || document.querySelector('[data-pvp-bitrate]');
                 if (infoTarget) infoTarget.textContent = `${mbps} Mbps`;
               }
-            } catch (err) {
-              console.warn('[Bitrate] Error:', err);
-            }
+            } catch (err) { console.warn('[Bitrate] Error:', err); }
           });
 
           hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
-            // 清单加载完毕后恢复播放位置（延迟一帧让 ArtPlayer 完成初始化再 seek）
             if (lastWatchedTime > 3 && !hasRestoredTime) {
               hasRestoredTime = true;
-              opSkipped = true; // 阻止 video:canplay 重复处理
               const { op } = getSkipForVod(currentVodID);
-              // 若上次观看位置仍在片头内，则直接从跳过点恢复，避免重看片头
               const seekTo = (op > 0 && lastWatchedTime < op) ? op : lastWatchedTime;
               const mm = Math.floor(seekTo / 60).toString().padStart(2, '0');
               const ss = Math.floor(seekTo % 60).toString().padStart(2, '0');
@@ -981,8 +1144,6 @@ function launchPlayer(streamUrl) {
     }
   });
 
-  console.log('Artplayer HEVC status:', dpInstance.plugins.artplayerPluginHevcWasm);
-
   dpInstance.on('ready', () => {
     const infoPanel = dpInstance.query('.art-info');
     if (infoPanel) {
@@ -991,11 +1152,20 @@ function launchPlayer(streamUrl) {
       row.innerHTML = '<div class="art-info-item-left">实时码率</div><div class="art-info-item-right" data-pvp-bitrate>检测中…</div>';
       infoPanel.appendChild(row);
       bitrateInfoEl = row.querySelector('[data-pvp-bitrate]');
-      console.log('[Bitrate Debug] Info panel row injected. bitrateInfoEl=', bitrateInfoEl);
-    } else {
-      console.warn('[Bitrate Debug] .art-info panel not found in ready event');
     }
   });
+
+  dpInstance.on('video:canplay', () => {
+    if (opSkipped) return;
+    const { op } = getSkipForVod(currentVodID);
+    if (op <= 0) return;
+    if (dpInstance.currentTime < op) {
+      opSkipped = true;
+      dpInstance.currentTime = op;
+      showToast(`已跳过片头 ${op} 秒`, 'success');
+    }
+  });
+
   dpInstance.on('video:error', () => {
     if (state.view !== 'player') return;
     if (isSniffing) return;
@@ -1005,9 +1175,10 @@ function launchPlayer(streamUrl) {
       if (!isSniffing && !dpInstance.playing) {
         if (currentEpUrl && sniffFallbackCount < 1) {
           sniffFallbackCount++;
+          if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); }
           triggerSniff(currentEpUrl, sourceName);
         } else {
-          showToast('播放出错，可能已过期。(若WAS加载报错请重试)', 'error');
+          showToast('播放出错，可能已过期。(若 WAS 加载报错请重试)', 'error');
         }
       }
     }, 2000);
@@ -1019,13 +1190,13 @@ function launchPlayer(streamUrl) {
     hideAllToasts();
     clearPlayerStatus();
 
-    // 显示 MANIFEST_PARSED 里准备好的恢复提示（hideAllToasts 之后再 show）
     if (pendingRestoreMsg) {
       showToast(pendingRestoreMsg, 'success');
       pendingRestoreMsg = '';
     }
 
-    clearSaveHistoryInterval(); saveHistoryInterval = setInterval(() => {
+    clearSaveHistoryInterval();
+    saveHistoryInterval = setInterval(() => {
       if (dpInstance && !dpInstance.video.paused) {
         window.electronAPI.saveHistory({
           vodID: currentVodID,
@@ -1046,21 +1217,6 @@ function launchPlayer(streamUrl) {
     }
   });
 
-  // 片头跳过 — 在 video:canplay 统一处理，确保自动跳集时也能可靠跳过
-  // （timeupdate 方案存在竞态：旧视频的 timeupdate 在 opSkipped 重置后仍会触发，误将其重新设为 true）
-  dpInstance.on('video:canplay', () => {
-    if (opSkipped) return;
-    const { op } = getSkipForVod(currentVodID);
-    if (op <= 0) return;
-    // 当前时间小于跳过点时才执行，排除已有观看记录且记录在跳过点之后的情况（由 MANIFEST_PARSED 处理）
-    if (dpInstance.currentTime < op) {
-      opSkipped = true;
-      dpInstance.currentTime = op;
-      showToast(`已跳过片头 ${op} 秒`, 'success');
-    }
-  });
-
-  // 片尾 skip — timeupdate 监听
   dpInstance.on('video:timeupdate', () => {
     if (edSkipTriggered) return;
     const dur = dpInstance.duration;
@@ -1081,9 +1237,7 @@ function launchPlayer(streamUrl) {
         currentTime: 0
       });
     }
-    if (hasNextEpisode()) {
-      showNextCountdownToast();
-    }
+    if (hasNextEpisode()) showNextCountdownToast();
   });
 }
 
@@ -1094,8 +1248,6 @@ function triggerSniff(url, sourceName = '') {
   sniffFallbackCount = 0;
   hideAllToasts();
 
-  // Mute but keep the player alive — switchUrl() will load the new stream
-  // without destroying fullscreen state.
   if (dpInstance) {
     try { dpInstance.pause(); } catch (_) {}
     try { if (dpInstance.video) dpInstance.video.muted = true; } catch (_) {}
@@ -1112,25 +1264,26 @@ function triggerSniff(url, sourceName = '') {
     isSniffing = false;
     setPlayerLoading(false);
     setPlayerStatus('✅ 正在播放', 'success');
+    console.log('[Sniffer] M3U8 received in renderer:', streamUrl);
+
     if (dpInstance) {
       try { dpInstance.video.muted = false; } catch (_) {}
-      dpInstance.switchUrl(streamUrl);
+
+      const wasFullscreen = !!document.fullscreenElement;
+      try {
+        if (wasFullscreen) { document.exitFullscreen().catch(() => {}); }
+        dpInstance.switchUrl(streamUrl);
+        if (wasFullscreen) {
+          dpInstance.once('video:canplay', () => { dpInstance.fullscreen = true; });
+        }
+      } catch (e) {
+        console.warn('[Sniff] switchUrl failed, relaunching player:', e.message);
+        launchPlayer(streamUrl);
+      }
     } else {
       launchPlayer(streamUrl);
     }
     setTimeout(clearPlayerStatus, 3000);
-
-    // 3秒后开始静默预嗅探下一集（等当前集缓冲稳定后再抢跑，避免网络竞争）
-    setTimeout(() => {
-      if (state.view !== 'player') return;
-      const activeBtn = epGrid.querySelector('.ep-btn.active');
-      const nextBtn = epSortDesc
-        ? activeBtn?.previousElementSibling
-        : activeBtn?.nextElementSibling;
-      if (nextBtn?.classList.contains('ep-btn') && nextBtn.dataset.url) {
-        window.electronAPI.preloadNext(nextBtn.dataset.url);
-      }
-    }, 3000);
   });
   window.electronAPI.onSniffError(msg => {
     if (state.view !== 'player') return;
@@ -1149,8 +1302,7 @@ function triggerSniff(url, sourceName = '') {
   window.electronAPI.sniffUrl(url, sourceName);
 }
 
-
-// Player toolbar — manual URL paste
+// ─── Player Toolbar ───────────────────────────────────────────────────────────
 playerLoadBtn.addEventListener('click', () => {
   const raw = playerUrlInput.value.trim();
   if (!raw) { showToast('请输入一个链接', 'error'); return; }
@@ -1165,7 +1317,7 @@ playerLoadBtn.addEventListener('click', () => {
 });
 playerUrlInput.addEventListener('keydown', e => { if (e.key === 'Enter') playerLoadBtn.click(); });
 
-// ─── Auto-Next Logic ──────────────────────────────────────────────────────────
+// ─── Auto-Next Logic ─────────────────────────────────────────────────────────
 function hasNextEpisode() {
   const activeBtn = epGrid.querySelector('.ep-btn.active');
   if (!activeBtn) return false;
@@ -1177,7 +1329,6 @@ function playNextEpisode() {
   const activeBtn = epGrid.querySelector('.ep-btn.active');
   if (!activeBtn) return false;
   const targetBtn = epSortDesc ? activeBtn.previousElementSibling : activeBtn.nextElementSibling;
-
   if (targetBtn && targetBtn.classList.contains('ep-btn')) {
     targetBtn.click();
     return true;
@@ -1193,35 +1344,21 @@ function showNextCountdownToast() {
 
   const toast = document.createElement('div');
   toast.id = 'next-countdown-toast';
-
-  toast.innerHTML = `
-    <span>正在播放下一集…</span>
-    <button id="cancel-next-btn">取消</button>
-  `;
-
+  toast.innerHTML = `<span>正在播放下一集…</span><button id="cancel-next-btn">取消</button>`;
   container.appendChild(toast);
 
-  toast.querySelector('#cancel-next-btn').onclick = (e) => {
-    e.stopPropagation();
-    hideNextCountdownToast();
-  };
+  toast.querySelector('#cancel-next-btn').onclick = (e) => { e.stopPropagation(); hideNextCountdownToast(); };
 
-  // 立即播放，无需倒计时
   playNextEpisode();
 }
 
 function hideNextCountdownToast() {
-  if (nextCountdownTimer) {
-    clearInterval(nextCountdownTimer);
-    nextCountdownTimer = null;
-  }
+  if (nextCountdownTimer) { clearInterval(nextCountdownTimer); nextCountdownTimer = null; }
   const toast = document.getElementById('next-countdown-toast');
   if (toast) toast.remove();
 }
 
-
-
-// ─── Toast ────────────────────────────────────────────────────────────────────
+// ─── Toast ───────────────────────────────────────────────────────────────────
 function showToast(msg, type = 'error') {
   const t = document.createElement('div');
   t.className = `toast ${type}`;
@@ -1253,7 +1390,25 @@ function showUpdateBanner(version) {
   document.body.appendChild(el);
 }
 
+// ─── Status listener ─────────────────────────────────────────────────────────
+function registerStatusListener() {
+  window.electronAPI.onStatusUpdate(msg => {
+    console.log('[Renderer] Status: ' + msg);
+  });
+}
+registerStatusListener();
+
 // ─── Boot ─────────────────────────────────────────────────────────────────────
+updateFilterBar();
+
+// Start loading immediately — no verification needed
+currentParams.baseCatId = 1;
+currentParams.id = 1;
+currentParams.page = 1;
+renderSubcatRow(1);
+loadFilterOptions(1);
+reloadCatalog();
+
 // Player-view favourite button
 document.getElementById('player-fav-btn').addEventListener('click', () => {
   if (!currentItem) return;
@@ -1306,5 +1461,13 @@ window.electronAPI.onUpdateError(err => {
   showToast(`更新检查失败: ${err}`, 'error');
 });
 
-updateFilterBar();
-loadPage(false);
+// ─── Window Controls (minimize / maximize / close) ─────────────────────────
+document.getElementById('btn-min').addEventListener('click', () => {
+  window.electronAPI.minimize();
+});
+document.getElementById('btn-max').addEventListener('click', () => {
+  window.electronAPI.maximize();
+});
+document.getElementById('btn-close').addEventListener('click', () => {
+  window.electronAPI.close();
+});

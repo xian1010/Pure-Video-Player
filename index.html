@@ -4,7 +4,7 @@
   <meta charset="UTF-8"/>
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src * data: blob: imgproxy:; media-src * blob:; connect-src *; worker-src 'self' blob:; child-src 'self' blob:;">
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Pure Video Player</title>
+  <title>小宝影院 - Pure Video Player</title>
   <meta name="description" content="Ad-free Chinese drama & movie streaming portal"/>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
@@ -36,6 +36,7 @@
     .logo { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; letter-spacing: .5px; }
     .logo svg { width: 18px; height: 18px; }
     .logo .accent { color: var(--accent2); }
+    #titlebar-right { display: flex; align-items: center; gap: 8px; -webkit-app-region: no-drag; }
     #win-controls { display: flex; gap: 4px; -webkit-app-region: no-drag; }
     .win-btn { width: 26px; height: 26px; border-radius: 6px; border: none; background: transparent; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background .15s; }
     .win-btn:hover { background: rgba(255,255,255,0.07); }
@@ -52,14 +53,16 @@
     /* ══════════════════════════════════════════════════════════════════════
        CATALOG VIEW
     ══════════════════════════════════════════════════════════════════════ */
-    #catalog-view { background: var(--bg); overflow: hidden; }
+    #catalog-view { background: var(--bg); overflow: hidden; position: relative; z-index: 0; }
 
     /* Category tabs + search row */
     #catalog-header {
+      position: relative;
       padding: 10px 20px 0;
       background: var(--surface);
       border-bottom: 1px solid var(--border);
       flex-shrink: 0;
+      z-index: 10;
     }
     #cat-search-row { display: flex; gap: 10px; align-items: center; padding-bottom: 10px; }
     #search-input {
@@ -498,16 +501,18 @@
       </svg>
       Pure<span class="accent">Video</span>Player
     </div>
-    <div id="win-controls">
-      <button class="win-btn" id="btn-min" title="Minimize">
-        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>
-      </button>
-      <button class="win-btn" id="btn-max" title="Maximize">
-        <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
-      </button>
-      <button class="win-btn close" id="btn-close" title="Close">
-        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
-      </button>
+    <div id="titlebar-right">
+      <div id="win-controls">
+        <button class="win-btn" id="btn-min" title="Minimize">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </button>
+        <button class="win-btn" id="btn-max" title="Maximize">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+        </button>
+        <button class="win-btn close" id="btn-close" title="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
+        </button>
+      </div>
     </div>
   </div>
 
@@ -626,6 +631,7 @@
 
 <script src="vendor/hls.min.js"></script>
 <script src="node_modules/artplayer/dist/artplayer.js"></script>
+<script src="remote-logic.js"></script>
 <script src="renderer.js"></script>
 </body>
 </html>
